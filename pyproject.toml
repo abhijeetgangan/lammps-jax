@@ -3,10 +3,11 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "lammps-jax-private"
+name = "lammps-jax"
 version = "0.1.0"
 description = "CUDA-first LAMMPS/Kokkos plugin support for exported JAX models"
 readme = "README.md"
+license = "MIT"
 requires-python = ">=3.10"
 dependencies = [
   "jax>=0.4.30",

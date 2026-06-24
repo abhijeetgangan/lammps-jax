@@ -46,3 +46,7 @@ LAMMPS_PLUGIN_PATH=build-plugin-gpu-pjrt \
 ```bash
 .venv/bin/python -m pytest
 ```
+
+## License
+
+MIT. See `LICENSE`.
