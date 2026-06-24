@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lammps-jax-private"
+version = "0.1.0"
+description = "CUDA-first LAMMPS/Kokkos plugin support for exported JAX models"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "jax>=0.4.30",
+  "jaxlib>=0.4.30",
+]
+
+[project.optional-dependencies]
+test = [
+  "pytest>=7",
+  "numpy>=1.24",
+]
+
+[tool.setuptools]
+package-dir = {"" = "python"}
+
+[tool.setuptools.packages.find]
+where = ["python"]
+
+[tool.pytest.ini_options]
+pythonpath = ["python"]
+testpaths = ["tests"]

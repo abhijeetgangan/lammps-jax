@@ -1,0 +1,27 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+
+# Native/CMake build outputs
+build*/
+*.so
+*.o
+*.a
+
+# Generated model bundles and simulation outputs
+examples/*.lammps-jax.json
+examples/*.lammpstrj
+examples/log.lammps
+log.lammps
+
+# Benchmark generated inputs, logs, CSVs, and plots
+examples/benchmark_lj*/
+examples/validate_lj*/
+
+# Local/editor/OS noise
+.DS_Store
+.vscode/
+.idea/
