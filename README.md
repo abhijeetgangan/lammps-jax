@@ -1,5 +1,7 @@
 # LAMMPS-JAX
 
+[![DOI](https://zenodo.org/badge/1278620240.svg)](https://doi.org/10.5281/zenodo.20838693)
+
 CUDA-first external LAMMPS/Kokkos plugin for running exported JAX models through
 `pair_style jax/kk`.
 
@@ -46,6 +48,17 @@ LAMMPS_PLUGIN_PATH=build-plugin-gpu-pjrt \
 ```bash
 .venv/bin/python -m pytest
 ```
+
+## Citation
+
+If you use `lammps-jax` or any algorithms implemented here, please cite the archived Zenodo release:
+
+https://doi.org/10.5281/zenodo.20838694
+
+## Acknowledgements
+
+Thanks to @mitkotak for API discussions and @wcwitt for guidance on distributed
+inference.
 
 ## License
 
