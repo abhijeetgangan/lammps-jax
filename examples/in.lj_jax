@@ -12,9 +12,9 @@ mass 1 1.0
 neighbor 0.3 bin
 neigh_modify every 1 delay 0 check yes one 256 page 500000
 
-# Pass the PJRT CUDA plugin path with: -var pjrt /absolute/path/xla_cuda_plugin.so
+# -var pjrt /absolute/path/xla_cuda_plugin.so; bundle path is repo-root relative.
 pair_style jax/kk ${pjrt}
-pair_coeff * * lj.lammps-jax.json
+pair_coeff * * examples/lj.lammps-jax.json
 
 velocity all create 0.1 12345
 fix int all nve

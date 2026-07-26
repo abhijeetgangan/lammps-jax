@@ -4,12 +4,19 @@
 #include "pjrt/api.h"
 
 #include <string>
+#include <vector>
 
 namespace pjrt {
 
-// Resolution order: explicit path, then the named environment variable, then
-// the bare plugin soname through the loader search path.
+class PluginLibrary;
+
+// Resolution order: explicit path, then the environment variable, then the bare soname.
 std::string resolve_plugin_path(const std::string &explicit_path, const char *env_var);
+
+// Registers external FFI handlers for the custom-call targets before
+// compilation, from LAMMPS_JAX_FFI_HANDLERS: target=/path/lib.so:symbol;...
+void register_external_ffi_handlers(const PluginLibrary &library,
+                                    const std::vector<std::string> &targets);
 
 class PluginLibrary {
  public:

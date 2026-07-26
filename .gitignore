@@ -5,23 +5,18 @@ __pycache__/
 .ruff_cache/
 *.egg-info/
 
-# Native/CMake build outputs
+# Build outputs
 build*/
 *.so
 *.o
 *.a
 
-# Generated model bundles and simulation outputs
+# Run outputs
 examples/*.lammps-jax.json
-examples/*.lammpstrj
-examples/log.lammps
+*.dump
 log.lammps
 
-# Benchmark generated inputs, logs, CSVs, and plots
-examples/benchmark_lj*/
-examples/validate_lj*/
-
-# Local/editor/OS noise
+# Editor/OS noise
 .DS_Store
 .vscode/
 .idea/

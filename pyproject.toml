@@ -10,8 +10,8 @@ readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
 dependencies = [
-  "jax>=0.4.30",
-  "jaxlib>=0.4.30",
+  "jax>=0.8",
+  "jaxlib>=0.8",
 ]
 
 [project.optional-dependencies]
@@ -36,3 +36,20 @@ where = ["python"]
 [tool.pytest.ini_options]
 pythonpath = ["python"]
 testpaths = ["tests"]
+
+[tool.basedpyright]
+venvPath = "."
+venv = ".venv"
+extraPaths = ["python", "tests"]
+
+[tool.ty.environment]
+python = "./.venv"
+root = ["python", "tests"]
+
+[[tool.ty.overrides]]
+include = ["tests/**"]
+
+[tool.ty.overrides.rules]
+invalid-argument-type = "ignore"
+invalid-assignment = "ignore"
+unsupported-operator = "ignore"

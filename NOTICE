@@ -1,0 +1,13 @@
+lammps-jax is licensed under the MIT license (see LICENSE).
+
+The following files are vendored from OpenXLA
+(https://github.com/openxla/xla), Copyright 2022-2024 The OpenXLA
+Authors, licensed under the Apache License, Version 2.0
+(http://www.apache.org/licenses/LICENSE-2.0):
+
+  cpp/third_party/pjrt_c_api.h            (xla/pjrt/c/pjrt_c_api.h)
+  cpp/third_party/pjrt_c_api_ffi_extension.h
+                                          (xla/pjrt/c/pjrt_c_api_ffi_extension.h)
+
+The only modification is the pjrt_c_api.h include path in the extension
+header; the C API header is unmodified apart from a provenance note.

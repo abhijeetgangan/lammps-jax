@@ -1,14 +1,15 @@
 #ifndef PJRT_API_H
 #define PJRT_API_H
 
-// The consuming project provides the PJRT C API header on its include path:
-// either the real jaxlib header or a vendored copy named pjrt_c_api.h.
+// Prefer a real PJRT header from jaxlib or XLA, then a bare copy, then the vendored fallback.
 #if __has_include("xla/pjrt/c/pjrt_c_api.h")
 #include "xla/pjrt/c/pjrt_c_api.h"
 #elif __has_include("pjrt_c_api.h")
 #include "pjrt_c_api.h"
+#elif __has_include("third_party/pjrt_c_api.h")
+#include "third_party/pjrt_c_api.h"
 #else
-#error "pjrt requires xla/pjrt/c/pjrt_c_api.h or pjrt_c_api.h on the include path"
+#error "pjrt requires the PJRT C API header on the include path"
 #endif
 
 #include <cstddef>
@@ -16,8 +17,7 @@
 
 namespace pjrt {
 
-// The CUDA stream extension is not part of the public C API header; these
-// mirror the layout exposed by the CUDA PJRT plugin.
+// The CUDA stream extension is absent from the public header; this mirrors the CUDA plugin.
 struct PJRT_Get_Stream_For_External_Ready_Events_Args_Local {
   size_t struct_size;
   PJRT_Device *device;

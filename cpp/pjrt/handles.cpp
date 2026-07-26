@@ -7,14 +7,10 @@
 
 namespace pjrt {
 
-namespace {
-
-// Extracts the message from a PJRT_Error and destroys the error object.
-// Returns "unknown PJRT error" when the message cannot be read. A null API is
-// tolerated because this path is already reporting a failure.
-std::string error_message_and_destroy(const PJRT_Api *api, PJRT_Error *error)
+void check(const PJRT_Api *api, PJRT_Error *error, const std::string &operation)
 {
-  if (error == nullptr) return "";
+  if (error == nullptr) return;
+  // Extracts the message and destroys the PJRT_Error; a null API is tolerated on this path.
   std::string message = "unknown PJRT error";
   if (api != nullptr && api->PJRT_Error_Message != nullptr) {
     PJRT_Error_Message_Args args{};
@@ -29,15 +25,7 @@ std::string error_message_and_destroy(const PJRT_Api *api, PJRT_Error *error)
     args.error = error;
     api->PJRT_Error_Destroy(&args);
   }
-  return message;
-}
-
-} // namespace
-
-void check(const PJRT_Api *api, PJRT_Error *error, const std::string &operation)
-{
-  if (error == nullptr) return;
-  throw std::runtime_error(operation + " failed: " + error_message_and_destroy(api, error));
+  throw std::runtime_error(operation + " failed: " + message);
 }
 
 void check_cuda(int cu_result, const std::string &operation)

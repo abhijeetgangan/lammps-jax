@@ -1,0 +1,19 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    env:
+      # The emulation tests compare against dense references with
+      # tolerances calibrated for CPU numerics.
+      JAX_PLATFORMS: cpu
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv venv .venv --python 3.13
+      - run: uv pip install -e '.[test]'
+      - run: .venv/bin/python -m pytest

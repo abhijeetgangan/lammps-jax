@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
 
 using namespace LAMMPS_NS;
@@ -30,20 +31,22 @@ using namespace LAMMPS_NS;
 namespace {
 
 #ifdef KOKKOS_ENABLE_CUDA
-template <class DeviceType>
+// Functors template on the contract precision Scalar: f32 pack narrows, f64 pack copies.
+template <class DeviceType, typename Scalar>
 struct PackAtomsFunctor {
   using AT = ArrayTypes<DeviceType>;
   typename AT::t_kkfloat_1d_3_lr_randomread x;
   typename AT::t_int_1d_randomread type;
-  Kokkos::View<float *[3], Kokkos::LayoutRight, DeviceType> positions;
+  Kokkos::View<Scalar *[3], Kokkos::LayoutRight, DeviceType> positions;
   Kokkos::View<int *, DeviceType> species;
 
   KOKKOS_INLINE_FUNCTION
   void operator()(const int i) const
   {
-    positions(i, 0) = static_cast<float>(x(i, 0));
-    positions(i, 1) = static_cast<float>(x(i, 1));
-    positions(i, 2) = static_cast<float>(x(i, 2));
+    positions(i, 0) = static_cast<Scalar>(x(i, 0));
+    positions(i, 1) = static_cast<Scalar>(x(i, 1));
+    positions(i, 2) = static_cast<Scalar>(x(i, 2));
+    // The model's species input is 0-based; LAMMPS types are 1-based.
     species(i) = type(i) - 1;
   }
 };
@@ -59,9 +62,12 @@ struct PackNeighborFunctor {
   int max_atoms;
   int max_edges;
   int max_neighbors_per_atom;
-  int inum;
+  // Local-atom rows, plus ghost-atom rows when n_hops exceeds 1.
+  int num_rows;
   bool duplicate_reverse_edges;
+  bool half_edges;
 
+  // copymode makes each per-launch functor copy's ~NeighListKokkos skip freeing shared storage.
   ~PackNeighborFunctor() { list.copymode = 1; }
 
   KOKKOS_INLINE_FUNCTION
@@ -69,11 +75,13 @@ struct PackNeighborFunctor {
   {
     const int ii = flat / max_neighbors_per_atom;
     const int jj = flat - ii * max_neighbors_per_atom;
-    if (ii >= inum) return;
+    if (ii >= num_rows) return;
     const int i = list.d_ilist(ii);
     if (i >= max_atoms || jj >= list.d_numneigh(i)) return;
     const int j = list.d_neighbors(i, jj) & NEIGHMASK;
     if (j >= max_atoms) return;
+    // Half-edge bundles keep one direction per pair; symmetrized models would double count.
+    if (half_edges && j < i) return;
 
     const int edges_to_add = duplicate_reverse_edges ? 2 : 1;
     const int edge = Kokkos::atomic_fetch_add(&edge_count(), edges_to_add);
@@ -92,11 +100,12 @@ struct PackNeighborFunctor {
   }
 };
 
-template <class DeviceType>
+// Adds model force rows into f: nall rows with newton on, nlocal rows with newton off.
+template <class DeviceType, typename Scalar>
 struct AddForcesFunctor {
   using AT = ArrayTypes<DeviceType>;
   typename AT::t_kkacc_1d_3 f;
-  Kokkos::View<const float *[3], Kokkos::LayoutRight, DeviceType,
+  Kokkos::View<const Scalar *[3], Kokkos::LayoutRight, DeviceType,
                Kokkos::MemoryTraits<Kokkos::Unmanaged>>
       model_forces;
   double scale;
@@ -110,14 +119,12 @@ struct AddForcesFunctor {
   }
 };
 
-// Launched over [0, cached_edge_count): the packed edge rows are contiguous,
-// so no mask test is needed here (only the padding rows past the count are
-// invalid, and they are never in range).
-template <class DeviceType>
+// Launched over [0, cached_edge_count): packed rows are contiguous, padding never in range.
+template <class DeviceType, typename Scalar>
 struct AddEdgeForcesFunctor {
   using AT = ArrayTypes<DeviceType>;
   typename AT::t_kkacc_1d_3 f;
-  Kokkos::View<const float *[3], Kokkos::LayoutRight, DeviceType,
+  Kokkos::View<const Scalar *[3], Kokkos::LayoutRight, DeviceType,
                Kokkos::MemoryTraits<Kokkos::Unmanaged>>
       edge_forces;
   Kokkos::View<int *, DeviceType> senders;
@@ -128,8 +135,7 @@ struct AddEdgeForcesFunctor {
   KOKKOS_INLINE_FUNCTION
   void operator()(const int edge) const
   {
-    // Senders are always owned atoms: edges come from rows 0..inum-1 of a
-    // local-atom neighbor list in both newton modes.
+    // Senders are owned atoms: edges come from local-list rows 0..inum-1 in both newton modes.
     const int i = senders(edge);
     const KK_ACC_FLOAT fx = static_cast<KK_ACC_FLOAT>(scale * edge_forces(edge, 0));
     const KK_ACC_FLOAT fy = static_cast<KK_ACC_FLOAT>(scale * edge_forces(edge, 1));
@@ -146,6 +152,7 @@ struct AddEdgeForcesFunctor {
   }
 };
 
+// Device tally matching Pair::virial_fdotr_compute; runs over owned and ghost rows.
 template <class DeviceType>
 struct VirialFDotRFunctor {
   using AT = ArrayTypes<DeviceType>;
@@ -164,18 +171,6 @@ struct VirialFDotRFunctor {
     virial.v[5] += f(i, 2) * static_cast<KK_ACC_FLOAT>(x(i, 1));
   }
 };
-
-CUevent record_ready_event(CUstream stream)
-{
-  CUevent event = nullptr;
-  if (cuEventCreate(&event, CU_EVENT_DISABLE_TIMING) != CUDA_SUCCESS)
-    throw std::runtime_error("Failed to create CUDA event for LAMMPS-JAX inputs");
-  if (cuEventRecord(event, stream) != CUDA_SUCCESS) {
-    cuEventDestroy(event);
-    throw std::runtime_error("Failed to record CUDA event for LAMMPS-JAX inputs");
-  }
-  return event;
-}
 
 #endif
 
@@ -221,9 +216,11 @@ void PairJaxKokkos::allocate_device_buffers()
 #ifdef KOKKOS_ENABLE_CUDA
   const int max_atoms = bundle.contract.max_atoms;
   const int max_edges = bundle.contract.max_edges;
-  // Kokkos zero-initializes these views, which is the padding contract:
-  // pack_atoms only writes the live rows.
-  d_positions = float_positions_view("lammps_jax_positions", max_atoms);
+  // Kokkos zero-init is the padding contract; only the contract-precision views are allocated.
+  if (f64_enabled())
+    d_positions_f64 = positions_view<double>("lammps_jax_positions", max_atoms);
+  else
+    d_positions = positions_view<float>("lammps_jax_positions", max_atoms);
   d_species = int_view("lammps_jax_species", max_atoms);
   d_nlocal = scalar_int_view("lammps_jax_nlocal");
   d_nghost = scalar_int_view("lammps_jax_nghost");
@@ -233,8 +230,13 @@ void PairJaxKokkos::allocate_device_buffers()
   d_receivers = int_view("lammps_jax_receivers", max_edges);
   d_edge_mask = bool_view("lammps_jax_edge_mask", max_edges);
   if (bundle.contract.uses_box) {
-    d_box = box_view("lammps_jax_box");
-    h_box = host_box_view("lammps_jax_host_box");
+    if (f64_enabled()) {
+      d_box_f64 = box_view<double>("lammps_jax_box");
+      h_box_f64 = host_box_view<double>("lammps_jax_host_box");
+    } else {
+      d_box = box_view<float>("lammps_jax_box");
+      h_box = host_box_view<float>("lammps_jax_host_box");
+    }
   }
 #endif
 }
@@ -242,6 +244,84 @@ void PairJaxKokkos::allocate_device_buffers()
 bool PairJaxKokkos::edge_force_enabled() const
 {
   return bundle.contract.force_layout == lammps_jax::ForceLayout::Edge;
+}
+
+bool PairJaxKokkos::comm_enabled() const
+{
+  return !bundle.contract.comm_widths.empty();
+}
+
+bool PairJaxKokkos::f64_enabled() const
+{
+  return bundle.contract.precision == lammps_jax::Precision::Float64;
+}
+
+// Pair comm buffers are opaque doubles end to end; two f32 features bit-pack per double slot.
+static inline int comm_double_slots(int width)
+{
+  return (width + 1) / 2;
+}
+
+// Runs on the LAMMPS MPI thread while execution waits in the FFI handler; staging is pinned host.
+void PairJaxKokkos::service_model_comm(const pjrt::ModelCommRequest &request)
+{
+  comm_rows = request.host_rows;
+  comm_width = request.width;
+  const ExecutionSpace saved_space = execution_space;
+  execution_space = Host;
+  if (request.forward)
+    comm->forward_comm(this, comm_double_slots(comm_width));
+  else
+    comm->reverse_comm(this, comm_double_slots(comm_width));
+  execution_space = saved_space;
+  comm_rows = nullptr;
+  comm_width = 0;
+}
+
+int PairJaxKokkos::pack_forward_comm(int n, int *list, double *buf, int /*pbc_flag*/, int * /*pbc*/)
+{
+  // Feature rows are not coordinates, so periodic image shifts do not apply.
+  const int slots = comm_double_slots(comm_width);
+  for (int i = 0; i < n; ++i) {
+    const float *row = comm_rows + static_cast<size_t>(list[i]) * comm_width;
+    float *packed = reinterpret_cast<float *>(buf + static_cast<size_t>(i) * slots);
+    for (int w = 0; w < comm_width; ++w) packed[w] = row[w];
+    if (comm_width & 1) packed[comm_width] = 0.0f;
+  }
+  return n * slots;
+}
+
+void PairJaxKokkos::unpack_forward_comm(int n, int first, double *buf)
+{
+  const int slots = comm_double_slots(comm_width);
+  for (int i = 0; i < n; ++i) {
+    float *row = comm_rows + static_cast<size_t>(first + i) * comm_width;
+    const float *packed = reinterpret_cast<const float *>(buf + static_cast<size_t>(i) * slots);
+    for (int w = 0; w < comm_width; ++w) row[w] = packed[w];
+  }
+}
+
+int PairJaxKokkos::pack_reverse_comm(int n, int first, double *buf)
+{
+  const int slots = comm_double_slots(comm_width);
+  for (int i = 0; i < n; ++i) {
+    const float *row = comm_rows + static_cast<size_t>(first + i) * comm_width;
+    float *packed = reinterpret_cast<float *>(buf + static_cast<size_t>(i) * slots);
+    for (int w = 0; w < comm_width; ++w) packed[w] = row[w];
+    if (comm_width & 1) packed[comm_width] = 0.0f;
+  }
+  return n * slots;
+}
+
+void PairJaxKokkos::unpack_reverse_comm(int n, int *list, double *buf)
+{
+  // Adjoint accumulation: ghost-row cotangents sum into their owner rows.
+  const int slots = comm_double_slots(comm_width);
+  for (int i = 0; i < n; ++i) {
+    float *row = comm_rows + static_cast<size_t>(list[i]) * comm_width;
+    const float *packed = reinterpret_cast<const float *>(buf + static_cast<size_t>(i) * slots);
+    for (int w = 0; w < comm_width; ++w) row[w] += packed[w];
+  }
 }
 
 void PairJaxKokkos::settings(int narg, char **arg)
@@ -265,24 +345,53 @@ void PairJaxKokkos::coeff(int narg, char **arg)
 
   try {
     bundle = lammps_jax::load_bundle_file(arg[2]);
-    if (bundle.contract.unit_style != update->unit_style)
-      error->all(FLERR, "LAMMPS-JAX model unit style does not match current units");
+  } catch (const std::exception &e) {
+    // error->one: a single rank can fail the load, and error->all would barrier-deadlock.
+    error->one(FLERR, "Failed to load LAMMPS-JAX model: {}", e.what());
+  }
+
+  // Outside any try: error->all throws, and a catch would nest it into an MPI_Abort.
+  if (bundle.contract.unit_style != update->unit_style)
+    error->all(FLERR, "LAMMPS-JAX model unit style does not match current units");
+  if (bundle.contract.n_species > 0 && atom->ntypes > bundle.contract.n_species)
+    error->all(FLERR,
+               "LAMMPS-JAX model distinguishes {} species but the system defines {} atom "
+               "types; types beyond the model's range would silently map to its last species",
+               bundle.contract.n_species, atom->ntypes);
+
+  try {
     pjrt::ClientOptions client_options;
 #ifdef KOKKOS_ENABLE_CUDA
     client_options.visible_device = exec.cuda_device();
 #endif
     if (const char *fraction = std::getenv("LAMMPS_JAX_MEM_FRACTION"))
       client_options.memory_fraction = std::atof(fraction);
+    pjrt::CommConfig comm_config;
+    if (comm_enabled()) {
+      comm_config.max_atoms = bundle.contract.max_atoms;
+      comm_config.widths = bundle.contract.comm_widths;
+      comm_config.callback =
+          [this](const pjrt::ModelCommRequest &request) { service_model_comm(request); };
+    }
     runtime = std::make_unique<pjrt::Runtime>();
     runtime->initialize(
         pjrt::resolve_plugin_path(pjrt_plugin_path, "LAMMPS_JAX_PJRT_PLUGIN_PATH"),
-        {bundle.programs.force_mlir, bundle.programs.energy_mlir,
-         bundle.programs.energy_and_forces_mlir},
-        bundle.compile_options, client_options);
+        bundle.programs.force_mlir, bundle.programs.energy_mlir,
+        bundle.programs.energy_and_forces_mlir,
+        bundle.compile_options, client_options, comm_config,
+        bundle.contract.custom_call_targets);
+    if (comm_enabled()) {
+      // LAMMPS sizes pair comm buffers once at init, in doubles; two f32 features per slot.
+      int max_width = 0;
+      for (const int width : bundle.contract.comm_widths) max_width = MAX(max_width, width);
+      comm_forward = (max_width + 1) / 2;
+      comm_reverse = (max_width + 1) / 2;
+    }
     allocate_device_buffers();
     model_loaded = true;
   } catch (const std::exception &e) {
-    error->all(FLERR, "Failed to load LAMMPS-JAX model: {}", e.what());
+    // error->one: driver state and device memory make PJRT setup rank-local.
+    error->one(FLERR, "Failed to initialize LAMMPS-JAX runtime: {}", e.what());
   }
 
   int count = 0;
@@ -305,9 +414,7 @@ void PairJaxKokkos::init_style()
     error->all(FLERR,
                "LAMMPS-JAX bundle was exported for newton pair off; this run uses newton on");
   if (atom->molecular != Atom::ATOMIC) {
-    // The packed graph applies full weight to every listed pair. Fully
-    // excluded pairs (lj 0, coul 0) never enter the neighbor list; any other
-    // special_bonds factor would be silently ignored.
+    // The graph applies full weight to every listed pair; partial special_bonds would be ignored.
     for (int n = 1; n <= 3; ++n) {
       if (force->special_lj[n] != 1.0 &&
           !(force->special_lj[n] == 0.0 && force->special_coul[n] == 0.0))
@@ -316,19 +423,33 @@ void PairJaxKokkos::init_style()
     }
   }
   if (!force->newton_pair) {
-    // Pair virial is available only via device f-dot-r, which needs the
-    // ghost force rows of the newton-on path. Barostats would silently
-    // regulate against a pressure missing the pair contribution.
+    // Pair virial needs newton-on ghost force rows; a barostat would see incomplete pressure.
     for (int i = 0; i < modify->nfix; ++i) {
       const char *style = modify->fix[i]->style;
-      if (strstr(style, "npt") || strstr(style, "nph") || strstr(style, "press"))
+      if (strstr(style, "npt") || strstr(style, "nph") || strstr(style, "press") ||
+          strstr(style, "box/relax") || strstr(style, "msst"))
         error->all(FLERR,
                    "Fix {} requires pair virial; run pair jax/kk with newton pair on",
                    style);
     }
   }
+  const bool multi_hop = bundle.contract.n_hops > 1;
   if (comm->me == 0) {
-    if (force->newton_pair)
+    if (comm_enabled()) {
+      int max_width = 0;
+      for (const int width : bundle.contract.comm_widths) max_width = MAX(max_width, width);
+      utils::logmesg(lmp,
+                     "LAMMPS-JAX: communicating bundle ({} exchange site(s), max width {}); "
+                     "node features are synchronized per layer through LAMMPS "
+                     "forward/reverse communication with a one-cutoff ghost shell.\n",
+                     bundle.contract.comm_widths.size(), max_width);
+    }
+    else if (multi_hop)
+      utils::logmesg(lmp,
+                     "LAMMPS-JAX: n_hops = {}; extending the ghost shell "
+                     "and evaluating node features redundantly on ghost atoms.\n",
+                     bundle.contract.n_hops);
+    else if (force->newton_pair)
       utils::logmesg(lmp,
                      "LAMMPS-JAX: using newton pair on with a Kokkos half neighbor list; "
                      "ghost force rows are accumulated for LAMMPS reverse communication.\n");
@@ -340,8 +461,49 @@ void PairJaxKokkos::init_style()
                      "LAMMPS-JAX: pair virial is computed only with newton pair on; "
                      "pressure output excludes pair contributions in this run.\n");
   }
-  // Newton on: default half list (owned-atom rows). Newton off: full list;
-  // ghost rows are not consumed, so no REQ_GHOST.
+  if (comm_enabled()) {
+    // Full list: owned atoms need complete rows; ghost features arrive via the exchange.
+    if (atom->molecular != Atom::ATOMIC) {
+      for (int n = 1; n <= 3; ++n) {
+        if (force->special_lj[n] != 1.0)
+          error->all(FLERR,
+                     "Communicating LAMMPS-JAX bundles require special_bonds 1 1 1");
+      }
+    }
+    auto request = neighbor->add_request(this, NeighConst::REQ_FULL);
+    request->set_kokkos_device(true);
+    request->set_kokkos_host(false);
+    return;
+  }
+  if (multi_hop) {
+    if (atom->molecular != Atom::ATOMIC) {
+      // Kokkos ghost builds skip special-bonds, making ghost-row features decomposition-dependent.
+      for (int n = 1; n <= 3; ++n) {
+        if (force->special_lj[n] != 1.0)
+          error->all(FLERR,
+                     "LAMMPS-JAX bundles with n_hops > 1 require special_bonds 1 1 1; "
+                     "ghost-atom neighbor rows do not apply exclusions");
+      }
+    }
+    // T hops need ghosts to T*r_cut plus skin; ghost forces return by reverse communication.
+    const double needed_cutoff =
+        bundle.contract.n_hops * bundle.contract.cutoff + neighbor->skin;
+    if (comm->get_comm_cutoff() < needed_cutoff) {
+      const std::string cutoff_val = std::to_string(needed_cutoff);
+      char *args[2];
+      args[0] = (char *) "cutoff";
+      args[1] = const_cast<char *>(cutoff_val.c_str());
+      comm->modify_params(2, args);
+      if (comm->me == 0)
+        error->warning(FLERR, "pair jax/kk is setting the communication cutoff to {}",
+                       cutoff_val);
+    }
+    auto request = neighbor->add_request(this, NeighConst::REQ_FULL | NeighConst::REQ_GHOST);
+    request->set_kokkos_device(true);
+    request->set_kokkos_host(false);
+    return;
+  }
+  // Newton on: half list over owned rows. Newton off: full list, no REQ_GHOST.
   auto request = force->newton_pair ? neighbor->add_request(this)
                                     : neighbor->add_request(this, NeighConst::REQ_FULL);
   request->set_kokkos_device(true);
@@ -359,17 +521,19 @@ double PairJaxKokkos::init_one(int i, int j)
 void PairJaxKokkos::pack_atoms(int nall, const PairJaxKokkos::x_view &x,
                                const PairJaxKokkos::type_view &type)
 {
-  // Padding rows keep their allocation-time zeros; rows past a shrinking
-  // nall hold stale data that only masked-out edges can reference. The span
-  // is clamped so the capacity-exceeded step (which errors out right after
-  // packing) cannot write out of bounds.
+  // Stale rows past a shrinking nall reach only masked edges; the clamp bounds writes.
   const int span = std::min(nall, bundle.contract.max_atoms);
-  Kokkos::parallel_for("LAMMPSJAX::pack_atoms", Kokkos::RangePolicy<LMPDeviceType>(exec, 0, span),
-                       PackAtomsFunctor<LMPDeviceType>{x, type, d_positions, d_species});
+  if (f64_enabled())
+    Kokkos::parallel_for("LAMMPSJAX::pack_atoms", Kokkos::RangePolicy<LMPDeviceType>(exec, 0, span),
+                         PackAtomsFunctor<LMPDeviceType, double>{x, type, d_positions_f64,
+                                                                 d_species});
+  else
+    Kokkos::parallel_for("LAMMPSJAX::pack_atoms", Kokkos::RangePolicy<LMPDeviceType>(exec, 0, span),
+                         PackAtomsFunctor<LMPDeviceType, float>{x, type, d_positions, d_species});
 }
 
 void PairJaxKokkos::pack_edges(NeighListKokkos<PairJaxKokkos::device_type> *klist,
-                               const PairJaxKokkos::x_view &x, bool rebuild_edges)
+                               bool rebuild_edges)
 {
   if (rebuild_edges) {
     Kokkos::deep_copy(exec, d_edge_count, 0);
@@ -379,41 +543,77 @@ void PairJaxKokkos::pack_edges(NeighListKokkos<PairJaxKokkos::device_type> *klis
     Kokkos::deep_copy(exec, d_receivers, bundle.contract.max_atoms);
 
     const int max_neighbors_per_atom = std::max(1, klist->maxneighs);
+    // Ghost features feed owned energies, so every ghost needs its full neighborhood.
+    const bool multi_hop = bundle.contract.n_hops > 1;
+    // The collective capacity check errors this step; the clamp bounds the flat index.
+    const int num_rows = std::min(klist->inum + (multi_hop ? klist->gnum : 0),
+                                  bundle.contract.max_atoms);
+    const long long flat_extent =
+        static_cast<long long>(num_rows) * max_neighbors_per_atom;
+    if (flat_extent > static_cast<long long>(std::numeric_limits<int>::max()))
+      error->one(FLERR,
+                 "LAMMPS-JAX neighbor pack index overflows int; reduce the bundle "
+                 "max_atoms or the neigh_modify one setting");
+    // Ghost and comm full lists already carry both edge directions.
+    const bool duplicate_reverse_edges =
+        force->newton_pair && !edge_force_enabled() && !multi_hop && !comm_enabled();
     Kokkos::parallel_for(
         "LAMMPSJAX::pack_neighbors",
-        Kokkos::RangePolicy<LMPDeviceType>(exec, 0, klist->inum * max_neighbors_per_atom),
+        Kokkos::RangePolicy<LMPDeviceType>(exec, 0, num_rows * max_neighbors_per_atom),
         PackNeighborFunctor<LMPDeviceType>{*klist, d_senders, d_receivers, d_edge_mask,
                                            d_edge_count, d_edge_overflow,
                                            bundle.contract.max_atoms, bundle.contract.max_edges,
-                                           max_neighbors_per_atom, klist->inum,
-                                           static_cast<bool>(force->newton_pair && !edge_force_enabled())});
+                                           max_neighbors_per_atom, num_rows,
+                                           duplicate_reverse_edges,
+                                           bundle.contract.half_edges});
   }
 }
 
+namespace {
+
+// Row-vector cell [[xprd,0,0],[xy,yprd,0],[xz,yz,zprd]] at the contract precision.
+template <class HostBoxView>
+void fill_host_box(const HostBoxView &h_box, const Domain *domain)
+{
+  using Scalar = typename HostBoxView::non_const_value_type;
+  h_box(0, 0) = static_cast<Scalar>(domain->xprd);
+  h_box(0, 1) = Scalar(0);
+  h_box(0, 2) = Scalar(0);
+  h_box(1, 0) = static_cast<Scalar>(domain->xy);
+  h_box(1, 1) = static_cast<Scalar>(domain->yprd);
+  h_box(1, 2) = Scalar(0);
+  h_box(2, 0) = static_cast<Scalar>(domain->xz);
+  h_box(2, 1) = static_cast<Scalar>(domain->yz);
+  h_box(2, 2) = static_cast<Scalar>(domain->zprd);
+}
+
+} // namespace
+
 void PairJaxKokkos::pack_box()
 {
-  // Row-vector cell matrix [[xprd,0,0],[xy,yprd,0],[xz,yz,zprd]], repacked
-  // every step so box-changing runs (NPT) stay consistent.
-  h_box(0, 0) = static_cast<float>(domain->xprd);
-  h_box(0, 1) = 0.0f;
-  h_box(0, 2) = 0.0f;
-  h_box(1, 0) = static_cast<float>(domain->xy);
-  h_box(1, 1) = static_cast<float>(domain->yprd);
-  h_box(1, 2) = 0.0f;
-  h_box(2, 0) = static_cast<float>(domain->xz);
-  h_box(2, 1) = static_cast<float>(domain->yz);
-  h_box(2, 2) = static_cast<float>(domain->zprd);
-  Kokkos::deep_copy(exec, d_box, h_box);
+  // Repacked every step so box-changing runs such as NPT stay consistent.
+  if (f64_enabled()) {
+    fill_host_box(h_box_f64, domain);
+    Kokkos::deep_copy(exec, d_box_f64, h_box_f64);
+  } else {
+    fill_host_box(h_box, domain);
+    Kokkos::deep_copy(exec, d_box, h_box);
+  }
 }
 
 pjrt::ExecutionRequest PairJaxKokkos::make_request(CUstream stream, CUevent ready_event)
 {
+  const bool f64 = f64_enabled();
+  const pjrt::ElementType real_type = f64 ? pjrt::ElementType::F64 : pjrt::ElementType::F32;
+  const CUdeviceptr positions_pointer =
+      f64 ? reinterpret_cast<CUdeviceptr>(d_positions_f64.data())
+          : reinterpret_cast<CUdeviceptr>(d_positions.data());
   pjrt::ExecutionRequest request;
   request.stream = stream;
   request.input_ready_event = ready_event;
+  request.scalar_type = real_type;
   request.inputs = {
-      {"positions", reinterpret_cast<CUdeviceptr>(d_positions.data()),
-       {bundle.contract.max_atoms, 3}, pjrt::ElementType::F32},
+      {"positions", positions_pointer, {bundle.contract.max_atoms, 3}, real_type},
       {"species", reinterpret_cast<CUdeviceptr>(d_species.data()), {bundle.contract.max_atoms},
        pjrt::ElementType::S32},
       {"nlocal", reinterpret_cast<CUdeviceptr>(d_nlocal.data()), {}, pjrt::ElementType::S32},
@@ -426,30 +626,42 @@ pjrt::ExecutionRequest PairJaxKokkos::make_request(CUstream stream, CUevent read
        pjrt::ElementType::Pred},
   };
   if (bundle.contract.uses_box) {
-    request.inputs.emplace_back("box", reinterpret_cast<CUdeviceptr>(d_box.data()),
-                                std::vector<int64_t>{3, 3}, pjrt::ElementType::F32);
+    const CUdeviceptr box_pointer = f64 ? reinterpret_cast<CUdeviceptr>(d_box_f64.data())
+                                        : reinterpret_cast<CUdeviceptr>(d_box.data());
+    request.inputs.emplace_back("box", box_pointer, std::vector<int64_t>{3, 3}, real_type);
   }
   return request;
+}
+
+template <typename Scalar>
+void PairJaxKokkos::add_model_forces_as(CUdeviceptr force_output, const PairJaxKokkos::f_view &f,
+                                        int nlocal, int nall)
+{
+  using ForceView = Kokkos::View<const Scalar *[3], Kokkos::LayoutRight, LMPDeviceType,
+                                Kokkos::MemoryTraits<Kokkos::Unmanaged>>;
+  if (edge_force_enabled()) {
+    ForceView edge_forces(reinterpret_cast<const Scalar *>(force_output), bundle.contract.max_edges);
+    Kokkos::parallel_for(
+        "LAMMPSJAX::add_edge_forces",
+        Kokkos::RangePolicy<LMPDeviceType>(exec, 0, cached_edge_count),
+        AddEdgeForcesFunctor<LMPDeviceType, Scalar>{f, edge_forces, d_senders, d_receivers,
+                                                    static_cast<bool>(force->newton_pair), scale});
+  } else {
+    ForceView model_forces(reinterpret_cast<const Scalar *>(force_output), bundle.contract.max_atoms);
+    const int limit = force->newton_pair ? nall : nlocal;
+    Kokkos::parallel_for("LAMMPSJAX::add_forces", Kokkos::RangePolicy<LMPDeviceType>(exec, 0, limit),
+                         AddForcesFunctor<LMPDeviceType, Scalar>{f, model_forces, scale});
+  }
 }
 
 void PairJaxKokkos::add_model_forces(CUdeviceptr force_output, const PairJaxKokkos::f_view &f,
                                      int nlocal, int nall)
 {
-  using ForceView = Kokkos::View<const float *[3], Kokkos::LayoutRight, LMPDeviceType,
-                                Kokkos::MemoryTraits<Kokkos::Unmanaged>>;
-  if (edge_force_enabled()) {
-    ForceView edge_forces(reinterpret_cast<const float *>(force_output), bundle.contract.max_edges);
-    Kokkos::parallel_for(
-        "LAMMPSJAX::add_edge_forces",
-        Kokkos::RangePolicy<LMPDeviceType>(exec, 0, cached_edge_count),
-        AddEdgeForcesFunctor<LMPDeviceType>{f, edge_forces, d_senders, d_receivers,
-                                            static_cast<bool>(force->newton_pair), scale});
-  } else {
-    ForceView model_forces(reinterpret_cast<const float *>(force_output), bundle.contract.max_atoms);
-    const int limit = force->newton_pair ? nall : nlocal;
-    Kokkos::parallel_for("LAMMPSJAX::add_forces", Kokkos::RangePolicy<LMPDeviceType>(exec, 0, limit),
-                         AddForcesFunctor<LMPDeviceType>{f, model_forces, scale});
-  }
+  // Model force rows are f32 or f64 per the contract precision.
+  if (f64_enabled())
+    add_model_forces_as<double>(force_output, f, nlocal, nall);
+  else
+    add_model_forces_as<float>(force_output, f, nlocal, nall);
 }
 #endif
 
@@ -460,12 +672,8 @@ void PairJaxKokkos::compute(int eflag, int vflag)
 #else
   ev_init(eflag, vflag, 0);
   if (!model_loaded || runtime == nullptr) error->all(FLERR, "LAMMPS-JAX runtime is not initialized");
-  // The global energy/virial flags are requested generously (every setup and
-  // thermo step, whatever the thermo style prints), so they cannot trigger
-  // hard errors. Unavailable quantities stay zero (ev_init cleared them) and
-  // init_style logs that once. Per-atom flags and ENERGY_ONLY are precise
-  // consumer signals (per-atom arrays are never allocated; ENERGY_ONLY is set
-  // manually by MC-style fixes), so those must abort when unavailable.
+  // Global energy/virial flags fire every thermo step, so unavailable values
+  // stay zero; per-atom flags and ENERGY_ONLY are real signals and must abort.
   if (eflag_atom) error->all(FLERR, "pair jax/kk does not support per-atom energy output");
   if (vflag_atom) error->all(FLERR, "pair jax/kk does not support per-atom virial output");
   if (eflag_only && bundle.programs.energy_mlir.empty())
@@ -494,16 +702,13 @@ void PairJaxKokkos::compute(int eflag, int vflag)
   CUstream stream = reinterpret_cast<CUstream>(exec.cuda_stream());
 
   pack_atoms(nall, x, type);
-  pack_edges(klist, x, rebuild_edges);
+  pack_edges(klist, rebuild_edges);
   if (bundle.contract.uses_box) pack_box();
 
   Kokkos::deep_copy(exec, d_nlocal, nlocal);
   Kokkos::deep_copy(exec, d_nghost, nghost);
   if (rebuild_edges) {
-    // Atom and edge counts only change on reneighbor steps, so capacity is
-    // checked here. One max-allreduce keeps the overflow error collective:
-    // every rank reaches the same error->all instead of deadlocking when only
-    // one rank exceeds capacity.
+    // Counts change only at reneighbor; the max-allreduce keeps the overflow error collective.
     int edge_overflow = 0;
     int edge_count = 0;
     Kokkos::deep_copy(edge_overflow, d_edge_overflow);
@@ -523,8 +728,15 @@ void PairJaxKokkos::compute(int eflag, int vflag)
 
   CUevent ready_event = nullptr;
   try {
-    ready_event = record_ready_event(stream);
+    // The catch below destroys the event on any failure past creation.
+    if (cuEventCreate(&ready_event, CU_EVENT_DISABLE_TIMING) != CUDA_SUCCESS)
+      throw std::runtime_error("Failed to create CUDA event for LAMMPS-JAX inputs");
+    if (cuEventRecord(ready_event, stream) != CUDA_SUCCESS)
+      throw std::runtime_error("Failed to record CUDA event for LAMMPS-JAX inputs");
     pjrt::ExecutionRequest request = make_request(stream, ready_event);
+    // Execution runs on a worker while this thread services exchanges through LAMMPS comm.
+    request.nlocal = nlocal;
+    request.nghost = nghost;
     pjrt::ExecutionResult result = energy_only_step ? runtime->execute_energy(request)
         : include_energy ? runtime->execute_energy_force(request)
                          : runtime->execute_force(request);
@@ -534,9 +746,7 @@ void PairJaxKokkos::compute(int eflag, int vflag)
         add_model_forces(force_output, f, nlocal, nall);
       });
       if (vflag_fdotr) {
-        // Device f-dot-r over owned + ghost rows; only reachable with newton
-        // on (LAMMPS uses per-pair tallying for newton off, which this style
-        // cannot provide). The reduce is stream-ordered after the force add.
+        // Device f-dot-r over owned and ghost rows, stream-ordered after the force add.
         EV_FLOAT virial_acc;
         Kokkos::parallel_reduce("LAMMPSJAX::virial_fdotr",
                                 Kokkos::RangePolicy<LMPDeviceType>(exec, 0, nall),
@@ -547,7 +757,8 @@ void PairJaxKokkos::compute(int eflag, int vflag)
     }
   } catch (const std::exception &e) {
     if (ready_event != nullptr) cuEventDestroy(ready_event);
-    error->all(FLERR, "LAMMPS-JAX compute failed: {}", e.what());
+    // error->one: execution failures are rank-local and cannot collectivize.
+    error->one(FLERR, "LAMMPS-JAX compute failed: {}", e.what());
   }
   if (ready_event != nullptr) cuEventDestroy(ready_event);
 #endif

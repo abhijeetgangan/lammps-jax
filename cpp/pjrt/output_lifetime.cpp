@@ -5,22 +5,6 @@
 
 namespace pjrt {
 
-namespace {
-
-CUevent record_event(CUstream stream)
-{
-  CUevent event = nullptr;
-  check_cuda(cuEventCreate(&event, CU_EVENT_DISABLE_TIMING), "create CUDA retirement event");
-  const CUresult record = cuEventRecord(event, stream);
-  if (record != CUDA_SUCCESS) {
-    cuEventDestroy(event);
-    check_cuda(record, "record CUDA retirement event");
-  }
-  return event;
-}
-
-} // namespace
-
 OutputLifetime::~OutputLifetime()
 {
   try {
@@ -66,22 +50,39 @@ void OutputLifetime::reset()
 
 void OutputLifetime::retire_pending(CUstream consumer_stream)
 {
-  // Reserve and record before moving the buffer: if either throws, the
-  // pending buffer must stay alive, not be destroyed under in-flight
-  // consumer kernels.
+  // Reserve and record before moving: a throw must leave the pending buffer alive.
   retired_outputs_.reserve(retired_outputs_.size() + 1);
-  CUevent ready_event = record_event(consumer_stream);
+  CUevent ready_event = nullptr;
+  check_cuda(cuEventCreate(&ready_event, CU_EVENT_DISABLE_TIMING), "create CUDA retirement event");
+  const CUresult record = cuEventRecord(ready_event, consumer_stream);
+  if (record != CUDA_SUCCESS) {
+    cuEventDestroy(ready_event);
+    check_cuda(record, "record CUDA retirement event");
+  }
   retired_outputs_.push_back({std::move(pending_force_output_), ready_event});
   pending_force_pointer_ = 0;
 }
 
 void OutputLifetime::collect_retired(bool wait)
 {
+  // Unprovable completion releases the buffer, a deliberate leak: destroy
+  // under in-flight kernels is a device use-after-free. First failure rethrows last.
   std::vector<RetiredOutput> keep;
+  CUresult first_failure = CUDA_SUCCESS;
+  const char *failure_context = nullptr;
   for (auto &item : retired_outputs_) {
     if (wait) {
-      check_cuda(cuEventSynchronize(item.ready_event), "wait for retired PJRT output");
-      cuEventDestroy(item.ready_event);
+      const CUresult sync = cuEventSynchronize(item.ready_event);
+      if (sync == CUDA_SUCCESS) {
+        cuEventDestroy(item.ready_event);
+      } else {
+        item.buffer.release();
+        cuEventDestroy(item.ready_event);
+        if (first_failure == CUDA_SUCCESS) {
+          first_failure = sync;
+          failure_context = "wait for retired PJRT output";
+        }
+      }
       continue;
     }
     const CUresult query = cuEventQuery(item.ready_event);
@@ -90,10 +91,16 @@ void OutputLifetime::collect_retired(bool wait)
     } else if (query == CUDA_ERROR_NOT_READY) {
       keep.push_back(std::move(item));
     } else {
-      check_cuda(query, "query retired PJRT output");
+      item.buffer.release();
+      cuEventDestroy(item.ready_event);
+      if (first_failure == CUDA_SUCCESS) {
+        first_failure = query;
+        failure_context = "query retired PJRT output";
+      }
     }
   }
   retired_outputs_.swap(keep);
+  if (first_failure != CUDA_SUCCESS) check_cuda(first_failure, failure_context);
 }
 
 } // namespace pjrt

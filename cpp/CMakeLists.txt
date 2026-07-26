@@ -11,7 +11,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 set(LAMMPS_HEADER_DIR "" CACHE PATH "Path to the LAMMPS src directory")
-set(JAXLIB_INCLUDE_DIR "" CACHE PATH "Path to jaxlib/include containing xla/pjrt/c/pjrt_c_api.h")
+set(JAXLIB_INCLUDE_DIR "" CACHE PATH "Path to jaxlib/include containing xla/ffi/api/ffi.h")
 set(PJRT_C_API_INCLUDE_DIR "" CACHE PATH "Optional path containing xla/pjrt/c/pjrt_c_api.h or pjrt_c_api.h")
 set(KOKKOS_CONFIG_INCLUDE_DIR "" CACHE PATH "Directory containing generated KokkosCore_config.h")
 
@@ -21,26 +21,14 @@ endif()
 if(NOT JAXLIB_INCLUDE_DIR)
   message(FATAL_ERROR "Set JAXLIB_INCLUDE_DIR to jaxlib/include")
 endif()
+if(NOT EXISTS "${JAXLIB_INCLUDE_DIR}/xla/ffi/api/ffi.h")
+  message(FATAL_ERROR
+    "xla/ffi/api/ffi.h was not found under JAXLIB_INCLUDE_DIR; model_comm.cpp "
+    "requires it and it has no vendored fallback.")
+endif()
 
 get_filename_component(LAMMPS_SOURCE_ROOT "${LAMMPS_HEADER_DIR}/.." ABSOLUTE)
 set(KOKKOS_ROOT "${LAMMPS_SOURCE_ROOT}/lib/kokkos")
-
-if(NOT KOKKOS_CONFIG_INCLUDE_DIR)
-  foreach(candidate
-      "${LAMMPS_SOURCE_ROOT}/build/lib/kokkos"
-      "${LAMMPS_SOURCE_ROOT}/build-lammps-jax-cpu/lib/kokkos"
-      "${LAMMPS_SOURCE_ROOT}/build-lammps-jax/lib/kokkos"
-      "${LAMMPS_SOURCE_ROOT}/build-lammps-jax-static/lib/kokkos"
-      "${LAMMPS_SOURCE_ROOT}/build-lammps-jax-wrapper/lib/kokkos"
-      "${LAMMPS_SOURCE_ROOT}/build-lammps-jax-rdc/lib/kokkos"
-      "${LAMMPS_SOURCE_ROOT}/build/_deps/kokkos-build"
-      "${CMAKE_BINARY_DIR}/lib/kokkos")
-    if(EXISTS "${candidate}/KokkosCore_config.h")
-      set(KOKKOS_CONFIG_INCLUDE_DIR "${candidate}")
-      break()
-    endif()
-  endforeach()
-endif()
 
 if(NOT EXISTS "${KOKKOS_CONFIG_INCLUDE_DIR}/KokkosCore_config.h")
   message(FATAL_ERROR
@@ -74,19 +62,18 @@ if(PJRT_C_API_INCLUDE_DIR)
   endif()
 endif()
 if(NOT PJRT_C_API_HEADER_FOUND)
-  message(FATAL_ERROR
-    "PJRT C API header was not found. Pass -DJAXLIB_INCLUDE_DIR=<jaxlib/include> "
-    "or -DPJRT_C_API_INCLUDE_DIR=<dir-containing-PJRT-header>.")
+  message(STATUS
+    "PJRT C API header not found under JAXLIB_INCLUDE_DIR or "
+    "PJRT_C_API_INCLUDE_DIR; using the vendored copy in cpp/third_party.")
 endif()
 
 add_library(lammps_jax MODULE
   lammps_jax_model.cpp
   lammps_jax_plugin.cpp
   pair_jax_kokkos.cpp
-  pjrt/buffer_interop.cpp
   pjrt/client_session.cpp
+  pjrt/model_comm.cpp
   pjrt/handles.cpp
-  pjrt/loaded_executable.cpp
   pjrt/plugin.cpp
   pjrt/output_lifetime.cpp
   pjrt/runtime.cpp

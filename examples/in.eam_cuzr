@@ -1,0 +1,49 @@
+# .venv/bin/python examples/export_model.py eam cuzr.lammps-jax.json \
+#   --setfl examples/potentials/CuZr.eam.alloy.gz \
+#   --max-atoms 8192 --edges-per-atom 128 --precision float64
+# lmp -k on g 1 -sf kk -pk kokkos newton on neigh half \
+#   -var pjrt /absolute/path/xla_cuda_plugin.so -in examples/in.eam_cuzr
+# Native reference force dump on a plain LAMMPS build:
+#   gunzip -k examples/potentials/CuZr.eam.alloy.gz
+#   lmp -var backend native -in examples/in.eam_cuzr
+
+variable backend index jax
+variable bundle index cuzr.lammps-jax.json
+variable setfl index examples/potentials/CuZr.eam.alloy
+variable dump_path index cuzr_static.dump
+
+units metal
+atom_style atomic
+boundary p p p
+newton on
+
+lattice bcc 3.26
+region box block 0 6 0 6 0 6
+create_box 2 box
+create_atoms 1 box basis 1 1 basis 2 2
+
+mass 1 63.546
+mass 2 91.224
+
+displace_atoms all random 0.1 0.1 0.1 12345 units box
+
+neighbor 1.0 bin
+neigh_modify every 1 delay 0 check yes one 512 page 500000
+
+if "${backend} == native" then &
+  "pair_style eam/alloy" &
+  "pair_coeff * * ${setfl} Cu Zr" &
+  "run_style verlet" &
+else &
+  "pair_style jax/kk ${pjrt}" &
+  "pair_coeff * * ${bundle}" &
+  "run_style verlet/kk"
+
+thermo 1
+thermo_style custom step atoms pe press
+thermo_modify norm no format float %.16g
+
+dump forces all custom 1 ${dump_path} id type x y z fx fy fz
+dump_modify forces sort id format float %.16g first yes
+
+run 0
