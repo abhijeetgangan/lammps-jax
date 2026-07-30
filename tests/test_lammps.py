@@ -20,6 +20,8 @@ from lammps_jax.eam import load_setfl, spline_lookup
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CUZR_SETFL = REPO_ROOT / "examples" / "potentials" / "CuZr.eam.alloy.gz"
+MACE_MP_DIR = Path(os.environ.get(
+    "MACE_MP_BUNDLE_DIR", REPO_ROOT.parent / "models" / "mace-mp-0-small-jax"))
 
 requires_lammps = pytest.mark.skipif(
     not all(os.environ.get(name)
@@ -75,6 +77,10 @@ EXPORTS = {
                        "--half-edges")),
     "eam_small": ("export_model.py",
                   ("eam", "{output}", "--max-atoms", "512", "--edges-per-atom", "64")),
+    "mace_comm": ("export_mace.py",
+                  ("export", "plain", "{output}", "--mode", "comm", "--type-z", "13",
+                   "--max-atoms", "2048", "--edges-per-atom", "16",
+                   "--bundle-dir", str(MACE_MP_DIR), "--skip-check")),
     "cuzr": ("export_model.py",
              ("eam", "{output}", "--setfl", "examples/potentials/CuZr.eam.alloy.gz",
               "--max-atoms", "8192", "--edges-per-atom", "128",
@@ -191,6 +197,44 @@ run_style verlet/kk
 run 0
 run 50
 """,
+    "mace_nve": """\
+variable bundle index mace.lammps-jax.json
+variable dump_path index mace_nve.dump
+
+units metal
+atom_style atomic
+boundary p p p
+newton on
+
+lattice fcc 4.05
+region box block 0 4 0 4 0 4
+create_box 1 box
+create_atoms 1 box
+mass 1 26.9815
+
+displace_atoms all random 0.05 0.05 0.05 12345 units box
+
+neighbor 1.0 bin
+neigh_modify every 1 delay 0 check yes one 512 page 500000
+
+pair_style jax/kk ${pjrt}
+pair_coeff * * ${bundle}
+
+velocity all create 300.0 4928459 loop geom
+fix integrate all nve
+timestep 0.002
+
+thermo 5
+thermo_style custom step atoms pe ke etotal press
+thermo_modify norm no format float %.16g
+
+dump trajectory all custom 5 ${dump_path} id type xu yu zu fx fy fz
+dump_modify trajectory sort id format float %.16g first yes
+
+run_style verlet/kk
+run 0
+run 50
+""",
     "cuzr_static": """\
 variable bundle index cuzr.lammps-jax.json
 variable dump_path index cuzr_static.dump
@@ -277,6 +321,8 @@ CASES = {
         pressure=True, float64=True, dense="cuzr",
         energy_tol=1.0e-12, pressure_tol=1.0e-8),
     "eam_nve": dict(kind="nve", deck="eam_nve", bundle="eam", dense="eam"),
+    "mace_comm_nve": dict(kind="nve", deck="mace_nve", bundle="mace_comm",
+                          pressure_tol=5.0e-2),
 }
 STATIC_CASES = [name for name, spec in CASES.items() if spec["kind"] == "static"]
 NVE_CASES = [name for name, spec in CASES.items() if spec["kind"] == "nve"]
@@ -675,6 +721,8 @@ class LammpsRunner:
         """The bundle path for `name`, exporting it on first use."""
         if name not in self.bundles:
             script, arguments = EXPORTS[name]
+            if script == "export_mace.py" and not (MACE_MP_DIR / "config.json").exists():
+                pytest.skip("converted MACE-MP bundle not available")
             path = self.out_dir / f"{name}.lammps-jax.json"
             env = dict(self.env)
             env["JAX_ENABLE_X64"] = "0"
@@ -791,7 +839,8 @@ def test_nve_trajectory(runner, case):
     assert (abs(potential[1] - potential[2]) / natoms
             <= MAX_RANK_ENERGY_ERROR_PER_ATOM)
     press = {n: first_thermo_value(screens[n], "Press") for n in (1, 2)}
-    assert abs(press[1] - press[2]) <= MAX_RANK_PRESSURE_ERROR
+    assert abs(press[1] - press[2]) <= spec.get("pressure_tol",
+                                                MAX_RANK_PRESSURE_ERROR)
     if spec.get("dense"):
         energy, forces = DENSE_REFERENCES[spec["dense"]](frames[1][0])
         dumped = np.stack([frames[1][0][name] for name in FORCE_COLUMNS], axis=1)

@@ -2,7 +2,7 @@
 
 [![DOI](https://zenodo.org/badge/1278620240.svg)](https://doi.org/10.5281/zenodo.20838693)
 
-JAX models in LAMMPS with `jax.export` + PJRT runtime
+LAMMPS plugin for running JAX forcefields with `jax.export` and a PJRT runtime
 
 ## Setup
 
@@ -13,6 +13,11 @@ uv pip install -U 'jax[cuda12]'
 ```
 
 ## Build
+
+The pair style needs the KOKKOS precision layer from LAMMPS 10 Sep 2025 or
+newer; stable releases do not carry it yet, and older trees stop at a
+compile-time error. Build the plugin against the same LAMMPS source tree as
+the `lmp` binary that loads it, and rebuild both together after pulling.
 
 ```bash
 cmake -S cpp -B build-plugin-gpu-pjrt \
@@ -32,6 +37,16 @@ cmake --build build-plugin-gpu-pjrt -j4
 ```bash
 .venv/bin/python examples/export_model.py lj examples/lj.lammps-jax.json \
   --max-atoms 1024 --edges-per-atom 96
+```
+
+The bundle loads as a pair style:
+
+```
+pair_style jax/kk ${pjrt}
+pair_coeff * * examples/lj.lammps-jax.json
+```
+
+```bash
 LAMMPS_PLUGIN_PATH=build-plugin-gpu-pjrt \
   "$LAMMPS_INSTALL/bin/lmp" -k on g 1 -pk kokkos newton off neigh full -sf kk \
   -var pjrt /absolute/path/xla_cuda_plugin.so -in examples/in.lj_jax

@@ -1,0 +1,41 @@
+# .venv/bin/python examples/export_mace.py export plain mace-mp.lammps-jax.json --type-z 13
+# lmp -k on g 1 -sf kk -pk kokkos newton on neigh half \
+#   -var pjrt /absolute/path/xla_cuda_plugin.so -in examples/in.mace_mp_al
+# steps=0 dumps frame-0 forces; steps>0 runs NVE at 300 K without a dump.
+
+variable bundle index mace-mp.lammps-jax.json
+variable steps index 0
+variable dump_path index al_static.dump
+
+units metal
+atom_style atomic
+boundary p p p
+newton on
+
+lattice fcc 4.05
+region box block 0 4 0 4 0 4
+create_box 1 box
+create_atoms 1 box
+mass 1 26.9815
+
+displace_atoms all random 0.08 0.08 0.08 12345 units box
+
+neighbor 1.0 bin
+neigh_modify every 1 delay 0 check yes one 512 page 500000
+
+pair_style jax/kk ${pjrt}
+pair_coeff * * ${bundle}
+
+thermo 20
+thermo_style custom step atoms pe press
+thermo_modify norm no format float %.16g
+
+if "${steps} == 0" then &
+  "dump forces all custom 1 ${dump_path} id type x y z fx fy fz" &
+  "dump_modify forces sort id format float %.16g first yes" &
+else &
+  "velocity all create 300.0 87287 loop geom" &
+  "fix 1 all nve"
+
+run_style verlet/kk
+run ${steps}

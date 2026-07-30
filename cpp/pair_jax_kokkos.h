@@ -10,7 +10,14 @@
 
 #include "pair.h"
 
+#include <type_traits>
+
 #include "kokkos_type.h"
+
+#if defined(KOKKOS_ENABLE_CUDA) && !defined(LMP_KOKKOS_DOUBLE_DOUBLE) && \
+    !defined(LMP_KOKKOS_SINGLE_SINGLE) && !defined(LMP_KOKKOS_SINGLE_DOUBLE)
+#error "pair jax/kk needs the KOKKOS precision layer: LAMMPS 10 Sep 2025 or newer"
+#endif
 
 #include <cuda.h>
 
@@ -67,28 +74,57 @@ class PairJaxKokkos : public Pair {
   using x_view = typename ArrayTypes<device_type>::t_kkfloat_1d_3_lr_randomread;
   using type_view = typename ArrayTypes<device_type>::t_int_1d_randomread;
   using f_view = typename ArrayTypes<device_type>::t_kkacc_1d_3;
-  // Positions and box stage at contract precision; only the matching f32 or f64 view is allocated.
   template <typename Scalar>
   using positions_view = Kokkos::View<Scalar *[3], Kokkos::LayoutRight, device_type>;
-  using int_view = Kokkos::View<int *, device_type>;
-  using bool_view = Kokkos::View<bool *, device_type>;
-  using scalar_int_view = Kokkos::View<int, device_type>;
   template <typename Scalar>
   using box_view = Kokkos::View<Scalar[3][3], Kokkos::LayoutRight, device_type>;
   template <typename Scalar>
   using host_box_view = Kokkos::View<Scalar[3][3], Kokkos::LayoutRight, Kokkos::HostSpace>;
+  // Positions and box stage at contract precision; only the matching f32 or f64 view is allocated.
+  template <typename Scalar>
+  struct Staging {
+    positions_view<Scalar> positions;
+    box_view<Scalar> box;
+    host_box_view<Scalar> host_box;
+  };
+  using int_view = Kokkos::View<int *, device_type>;
+  using bool_view = Kokkos::View<bool *, device_type>;
+  using scalar_int_view = Kokkos::View<int, device_type>;
 
   void pack_atoms(int nall, const x_view &x, const type_view &type);
+  template <typename Scalar>
+  void pack_atoms_as(int span, const x_view &x, const type_view &type);
   void pack_edges(NeighListKokkos<device_type> *klist, bool rebuild_edges);
   void pack_box();
+  template <typename Scalar>
+  void pack_box_as();
   pjrt::ExecutionRequest make_request(CUstream stream, CUevent ready_event);
+  template <typename Scalar>
+  pjrt::ExecutionRequest make_request_as(CUstream stream, CUevent ready_event);
+  template <typename Scalar>
+  void allocate_staging_as(int max_atoms);
   void add_model_forces(CUdeviceptr force_output, const f_view &f, int nlocal, int nall);
   template <typename Scalar>
   void add_model_forces_as(CUdeviceptr force_output, const f_view &f, int nlocal, int nall);
 
   device_type exec;
-  positions_view<float> d_positions;
-  positions_view<double> d_positions_f64;
+  Staging<float> staging32;
+  Staging<double> staging64;
+  template <typename Scalar>
+  Staging<Scalar> &staging()
+  {
+    if constexpr (std::is_same_v<Scalar, double>)
+      return staging64;
+    else
+      return staging32;
+  }
+  // Calls f with a float or double value per the contract precision; f deduces Scalar from it.
+  template <typename F>
+  auto dispatch_by_precision(F &&f)
+  {
+    if (f64_enabled()) return f(double{});
+    return f(float{});
+  }
   int_view d_species;
   scalar_int_view d_nlocal;
   scalar_int_view d_nghost;
@@ -97,10 +133,6 @@ class PairJaxKokkos : public Pair {
   int_view d_senders;
   int_view d_receivers;
   bool_view d_edge_mask;
-  box_view<float> d_box;
-  host_box_view<float> h_box;
-  box_view<double> d_box_f64;
-  host_box_view<double> h_box_f64;
 #endif
 };
 

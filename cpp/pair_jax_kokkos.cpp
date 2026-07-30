@@ -217,10 +217,7 @@ void PairJaxKokkos::allocate_device_buffers()
   const int max_atoms = bundle.contract.max_atoms;
   const int max_edges = bundle.contract.max_edges;
   // Kokkos zero-init is the padding contract; only the contract-precision views are allocated.
-  if (f64_enabled())
-    d_positions_f64 = positions_view<double>("lammps_jax_positions", max_atoms);
-  else
-    d_positions = positions_view<float>("lammps_jax_positions", max_atoms);
+  dispatch_by_precision([&](auto p) { allocate_staging_as<decltype(p)>(max_atoms); });
   d_species = int_view("lammps_jax_species", max_atoms);
   d_nlocal = scalar_int_view("lammps_jax_nlocal");
   d_nghost = scalar_int_view("lammps_jax_nghost");
@@ -229,17 +226,21 @@ void PairJaxKokkos::allocate_device_buffers()
   d_senders = int_view("lammps_jax_senders", max_edges);
   d_receivers = int_view("lammps_jax_receivers", max_edges);
   d_edge_mask = bool_view("lammps_jax_edge_mask", max_edges);
-  if (bundle.contract.uses_box) {
-    if (f64_enabled()) {
-      d_box_f64 = box_view<double>("lammps_jax_box");
-      h_box_f64 = host_box_view<double>("lammps_jax_host_box");
-    } else {
-      d_box = box_view<float>("lammps_jax_box");
-      h_box = host_box_view<float>("lammps_jax_host_box");
-    }
-  }
 #endif
 }
+
+#ifdef KOKKOS_ENABLE_CUDA
+template <typename Scalar>
+void PairJaxKokkos::allocate_staging_as(int max_atoms)
+{
+  auto &views = staging<Scalar>();
+  views.positions = positions_view<Scalar>("lammps_jax_positions", max_atoms);
+  if (bundle.contract.uses_box) {
+    views.box = box_view<Scalar>("lammps_jax_box");
+    views.host_box = host_box_view<Scalar>("lammps_jax_host_box");
+  }
+}
+#endif
 
 bool PairJaxKokkos::edge_force_enabled() const
 {
@@ -523,13 +524,16 @@ void PairJaxKokkos::pack_atoms(int nall, const PairJaxKokkos::x_view &x,
 {
   // Stale rows past a shrinking nall reach only masked edges; the clamp bounds writes.
   const int span = std::min(nall, bundle.contract.max_atoms);
-  if (f64_enabled())
-    Kokkos::parallel_for("LAMMPSJAX::pack_atoms", Kokkos::RangePolicy<LMPDeviceType>(exec, 0, span),
-                         PackAtomsFunctor<LMPDeviceType, double>{x, type, d_positions_f64,
-                                                                 d_species});
-  else
-    Kokkos::parallel_for("LAMMPSJAX::pack_atoms", Kokkos::RangePolicy<LMPDeviceType>(exec, 0, span),
-                         PackAtomsFunctor<LMPDeviceType, float>{x, type, d_positions, d_species});
+  dispatch_by_precision([&](auto p) { pack_atoms_as<decltype(p)>(span, x, type); });
+}
+
+template <typename Scalar>
+void PairJaxKokkos::pack_atoms_as(int span, const PairJaxKokkos::x_view &x,
+                                  const PairJaxKokkos::type_view &type)
+{
+  Kokkos::parallel_for("LAMMPSJAX::pack_atoms", Kokkos::RangePolicy<LMPDeviceType>(exec, 0, span),
+                       PackAtomsFunctor<LMPDeviceType, Scalar>{x, type, staging<Scalar>().positions,
+                                                               d_species});
 }
 
 void PairJaxKokkos::pack_edges(NeighListKokkos<PairJaxKokkos::device_type> *klist,
@@ -592,22 +596,30 @@ void fill_host_box(const HostBoxView &h_box, const Domain *domain)
 void PairJaxKokkos::pack_box()
 {
   // Repacked every step so box-changing runs such as NPT stay consistent.
-  if (f64_enabled()) {
-    fill_host_box(h_box_f64, domain);
-    Kokkos::deep_copy(exec, d_box_f64, h_box_f64);
-  } else {
-    fill_host_box(h_box, domain);
-    Kokkos::deep_copy(exec, d_box, h_box);
-  }
+  dispatch_by_precision([&](auto p) { pack_box_as<decltype(p)>(); });
+}
+
+template <typename Scalar>
+void PairJaxKokkos::pack_box_as()
+{
+  auto &views = staging<Scalar>();
+  fill_host_box(views.host_box, domain);
+  Kokkos::deep_copy(exec, views.box, views.host_box);
 }
 
 pjrt::ExecutionRequest PairJaxKokkos::make_request(CUstream stream, CUevent ready_event)
 {
-  const bool f64 = f64_enabled();
-  const pjrt::ElementType real_type = f64 ? pjrt::ElementType::F64 : pjrt::ElementType::F32;
-  const CUdeviceptr positions_pointer =
-      f64 ? reinterpret_cast<CUdeviceptr>(d_positions_f64.data())
-          : reinterpret_cast<CUdeviceptr>(d_positions.data());
+  return dispatch_by_precision(
+      [&](auto p) { return make_request_as<decltype(p)>(stream, ready_event); });
+}
+
+template <typename Scalar>
+pjrt::ExecutionRequest PairJaxKokkos::make_request_as(CUstream stream, CUevent ready_event)
+{
+  auto &views = staging<Scalar>();
+  const pjrt::ElementType real_type =
+      std::is_same_v<Scalar, double> ? pjrt::ElementType::F64 : pjrt::ElementType::F32;
+  const CUdeviceptr positions_pointer = reinterpret_cast<CUdeviceptr>(views.positions.data());
   pjrt::ExecutionRequest request;
   request.stream = stream;
   request.input_ready_event = ready_event;
@@ -626,8 +638,7 @@ pjrt::ExecutionRequest PairJaxKokkos::make_request(CUstream stream, CUevent read
        pjrt::ElementType::Pred},
   };
   if (bundle.contract.uses_box) {
-    const CUdeviceptr box_pointer = f64 ? reinterpret_cast<CUdeviceptr>(d_box_f64.data())
-                                        : reinterpret_cast<CUdeviceptr>(d_box.data());
+    const CUdeviceptr box_pointer = reinterpret_cast<CUdeviceptr>(views.box.data());
     request.inputs.emplace_back("box", box_pointer, std::vector<int64_t>{3, 3}, real_type);
   }
   return request;
@@ -658,10 +669,8 @@ void PairJaxKokkos::add_model_forces(CUdeviceptr force_output, const PairJaxKokk
                                      int nlocal, int nall)
 {
   // Model force rows are f32 or f64 per the contract precision.
-  if (f64_enabled())
-    add_model_forces_as<double>(force_output, f, nlocal, nall);
-  else
-    add_model_forces_as<float>(force_output, f, nlocal, nall);
+  dispatch_by_precision(
+      [&](auto p) { add_model_forces_as<decltype(p)>(force_output, f, nlocal, nall); });
 }
 #endif
 

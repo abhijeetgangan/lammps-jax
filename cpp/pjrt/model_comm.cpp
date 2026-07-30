@@ -144,7 +144,7 @@ void ModelComm::initialize(const PJRT_Api *api, int max_atoms, const std::vector
         "PJRT plugin does not expose the FFI handler registration required by "
         "communicating bundles; use a newer jax CUDA plugin or a non-communicating bundle");
 
-  // Execute-context support is late C API; an older plugin's struct simply ends before it.
+  // Execute-context support is late C API; an older plugin's struct ends before it.
   if (api->struct_size < PJRT_STRUCT_SIZE(PJRT_Api, PJRT_ExecuteContext_Destroy))
     throw std::runtime_error(
         "PJRT plugin is too old for communicating bundles (no execute-context "

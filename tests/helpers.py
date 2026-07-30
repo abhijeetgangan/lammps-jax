@@ -263,7 +263,7 @@ def make_toy_mp_energy(
 def native_interpolate(values):
     """PairEAM::interpolate transcribed for reference coefficients.
 
-    Deliberately independent of lammps_jax.eam.spline_coefficients."""
+    Kept independent of lammps_jax.eam.spline_coefficients."""
     f = np.asarray(values, dtype=np.float64)
     n = len(f)
     d = np.zeros(n)
