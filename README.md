@@ -2,7 +2,8 @@
 
 [![DOI](https://zenodo.org/badge/1278620240.svg)](https://doi.org/10.5281/zenodo.20838693)
 
-LAMMPS plugin for running JAX forcefields with `jax.export` and a PJRT runtime
+[LAMMPS](https://www.lammps.org) plugin for running JAX forcefields with
+`jax.export` and a PJRT runtime.
 
 ## Setup
 
@@ -75,7 +76,11 @@ the archived Zenodo release: https://doi.org/10.5281/zenodo.20838694
 ## Acknowledgements
 
 Thanks to @mitkotak for API discussions and @wcwitt for guidance on
-distributed inference.
+distributed inference. See
+[lammps/lammps#4691](https://github.com/lammps/lammps/pull/4691) for the
+original discussion on running JAX models in LAMMPS, and
+[openmm-jax](https://github.com/atomicarchitects/openmm-jax) for the OpenMM
+counterpart.
 
 ## License
 
