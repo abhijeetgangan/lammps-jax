@@ -10,7 +10,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        suite: [export, eam, distributed, mace, lammps]
+        suite: [export, eam, distributed, lammps]
     env:
       # The emulation tests compare against dense references with
       # tolerances calibrated for CPU numerics.
@@ -21,3 +21,28 @@ jobs:
       - run: uv venv .venv --python 3.13
       - run: uv pip install -e '.[test]'
       - run: .venv/bin/python -m pytest tests/test_${{ matrix.suite }}.py
+
+  mace:
+    runs-on: ubuntu-latest
+    env:
+      JAX_PLATFORMS: cpu
+      MACE_MP_BUNDLE_DIR: ${{ github.workspace }}/mace-mp-bundle
+      MODEL_URL: https://github.com/ACEsuit/mace-mp/releases/download/mace_mp_0/2023-12-10-mace-128-L0_energy_epoch-249.model
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv venv .venv --python 3.13
+      - run: uv pip install -e '.[test]'
+      - run: >
+          uv pip install --torch-backend=cpu mace-torch
+          'mace-jax @ git+https://github.com/ACEsuit/mace-jax@fe19806ad8077a90975eeb83fdd777a9513e9f0c'
+      - uses: actions/cache@v4
+        id: bundle
+        with:
+          path: mace-mp-bundle
+          key: mace-mp-bundle-${{ hashFiles('examples/export_mace.py') }}
+      - if: steps.bundle.outputs.cache-hit != 'true'
+        run: |
+          curl -sL -o mp0.model "$MODEL_URL"
+          .venv/bin/python examples/export_mace.py convert mp0.model "$MACE_MP_BUNDLE_DIR"
+      - run: .venv/bin/python -m pytest tests/test_mace.py

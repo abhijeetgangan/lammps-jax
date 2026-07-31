@@ -17,7 +17,6 @@ dependencies = [
 [project.optional-dependencies]
 dist = [
   "ase>=3.22",
-  "dm-haiku>=0.0.12",
   "e3nn-jax>=0.20",
   "jax-md>=0.2.27",
   "nequix>=0.4",
