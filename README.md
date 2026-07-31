@@ -9,6 +9,7 @@
 
 ```bash
 uv venv .venv --python python3
+source .venv/bin/activate
 uv pip install -e '.[test]'
 uv pip install -U 'jax[cuda12]'
 ```
@@ -36,7 +37,7 @@ cmake --build build-plugin-gpu-pjrt -j4
 ## Run
 
 ```bash
-.venv/bin/python examples/export_model.py lj examples/lj.lammps-jax.json \
+python examples/export_model.py lj examples/lj.lammps-jax.json \
   --max-atoms 1024 --edges-per-atom 96
 ```
 
@@ -56,7 +57,7 @@ LAMMPS_PLUGIN_PATH=build-plugin-gpu-pjrt \
 ## Test
 
 ```bash
-JAX_PLATFORMS=cpu .venv/bin/python -m pytest
+JAX_PLATFORMS=cpu python -m pytest
 ```
 
 Integration tests, which require a GPU and LAMMPS:
@@ -65,8 +66,33 @@ Integration tests, which require a GPU and LAMMPS:
 LAMMPS_BIN=$LAMMPS_INSTALL/bin/lmp \
 PJRT_PLUGIN=/absolute/path/xla_cuda_plugin.so \
 LAMMPS_PLUGIN_PATH=$PWD/build-plugin-gpu-pjrt \
-  .venv/bin/python -m pytest tests/test_lammps.py -v
+  python -m pytest tests/test_lammps.py -v
 ```
+
+## Design notes
+
+Models are exported with `jax.export` into a JSON bundle holding the
+serialized program and the settings the pair style enforces at load: atom and
+edge capacities, cutoff, precision, unit style, and the distribution scheme.
+Exported programs have static shapes, so positions and the edge list are
+padded to capacity and an edge mask marks the live entries.
+
+The pair style executes the bundle through the PJRT C API, loading the same
+plugin library jax uses on the GPU; nothing links against XLA. Kokkos kernels
+pack the LAMMPS neighbor list into sender, receiver, and mask arrays on
+device, the program runs on the LAMMPS CUDA stream, and forces come back as
+device buffers, so array data never passes through the host.
+
+Multi-rank runs pick one of two schemes at export. A ghost export widens the
+ghost shell to n_hops cutoffs and stays communication-free inside the
+program; a comm export keeps the one-cutoff shell and exchanges per-layer
+features through LAMMPS forward and reverse communication, called from inside
+the program as an FFI callback.
+
+cuEquivariance and OpenEquivariance kernels stay in the exported program as
+custom call targets, resolved at run time from LAMMPS_JAX_FFI_HANDLERS;
+contrib/ffi-replay handles libraries whose compiled kernels only exist inside
+the exporting process.
 
 ## Citation
 
