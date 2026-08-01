@@ -78,7 +78,7 @@ Exported programs have static shapes, so positions and the edge list are
 padded to capacity and an edge mask marks the live entries.
 
 The pair style executes the bundle through the PJRT C API, loading the same
-plugin library jax uses on the GPU; nothing links against XLA. Kokkos kernels
+plugin library jax uses on the GPU, so the build never needs XLA. Kokkos kernels
 pack the LAMMPS neighbor list into sender, receiver, and mask arrays on
 device, the program runs on the LAMMPS CUDA stream, and forces come back as
 device buffers, so array data never passes through the host.

@@ -51,8 +51,12 @@ class ModelComm {
   // Per-step row counts; call before launching an execution.
   void begin_step(int nlocal, int nghost);
 
-  // Exchange in place on device rows, skipping the pinned staging.
-  void set_device_rows(bool enabled) { device_rows_ = enabled; }
+  // Exchange in place on device rows; pack_stream runs the pack/unpack kernels.
+  void set_device_rows(bool enabled, CUstream pack_stream)
+  {
+    device_rows_ = enabled;
+    pack_stream_ = pack_stream;
+  }
 
   // Protocol: begin_service; worker executes and marks done; service_loop; worker.get.
   void begin_service();
@@ -79,6 +83,7 @@ class ModelComm {
   // Pinned staging shared by all sites; the token chain serializes communications.
   float *pinned_ = nullptr;
   CUevent staged_event_ = nullptr;
+  CUevent unpacked_event_ = nullptr;
 
   std::mutex mutex_;
   std::condition_variable condition_;
@@ -88,6 +93,7 @@ class ModelComm {
   std::string service_error_;
   bool servicing_ = false;
   bool device_rows_ = false;
+  CUstream pack_stream_ = nullptr;
   bool done_ = false;
   int nlocal_ = 0;
   int nghost_ = 0;

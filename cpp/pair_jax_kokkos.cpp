@@ -344,8 +344,7 @@ void PairJaxKokkos::service_model_comm(const pjrt::ModelCommRequest &request)
       comm->forward_comm(this, comm_double_slots(comm_width));
     else
       comm->reverse_comm(this, comm_double_slots(comm_width));
-    // Unpack runs on the Kokkos stream; execution resumes on the model stream.
-    exec.fence();
+    // The model stream waits on the unpack through events; no host fence.
     d_comm_rows = nullptr;
   } else {
     comm_rows = request.host_rows;
@@ -565,7 +564,8 @@ void PairJaxKokkos::init_style()
                    dynamic_cast<CommTiledKokkos *>(comm) != nullptr) &&
                   !lmp->kokkos->forward_pair_comm_legacy &&
                   !lmp->kokkos->reverse_pair_comm_legacy;
-    runtime->model_comm()->set_device_rows(device_comm);
+    runtime->model_comm()->set_device_rows(device_comm,
+                                           device_comm ? exec.cuda_stream() : nullptr);
   }
   const bool multi_hop = bundle.contract.n_hops > 1;
   if (comm->me == 0) {

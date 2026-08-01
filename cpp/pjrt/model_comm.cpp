@@ -230,6 +230,8 @@ void ModelComm::initialize(const PJRT_Api *api, int max_atoms, const std::vector
              "allocate pinned model comm staging");
   check_cuda(cuEventCreate(&staged_event_, CU_EVENT_DISABLE_TIMING),
              "create model comm staging event");
+  check_cuda(cuEventCreate(&unpacked_event_, CU_EVENT_DISABLE_TIMING),
+             "create model comm unpack event");
 }
 
 void ModelComm::close(const PJRT_Api *api)
@@ -253,6 +255,10 @@ void ModelComm::close(const PJRT_Api *api)
   if (staged_event_ != nullptr) {
     cuEventDestroy(staged_event_);
     staged_event_ = nullptr;
+  }
+  if (unpacked_event_ != nullptr) {
+    cuEventDestroy(unpacked_event_);
+    unpacked_event_ = nullptr;
   }
   api_ = nullptr;
 }
@@ -351,6 +357,7 @@ std::string ModelComm::comm_from_handler(bool forward, CUstream stream, const vo
   int nlocal = 0;
   int nghost = 0;
   bool device = false;
+  CUstream pack_stream = nullptr;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!servicing_)
@@ -360,6 +367,7 @@ std::string ModelComm::comm_from_handler(bool forward, CUstream stream, const vo
     nlocal = nlocal_;
     nghost = nghost_;
     device = device_rows_;
+    pack_stream = pack_stream_;
   }
 
   const size_t row_bytes = static_cast<size_t>(width) * sizeof(float);
@@ -378,7 +386,11 @@ std::string ModelComm::comm_from_handler(bool forward, CUstream stream, const vo
                                  stream),
                "model comm stage to host");
   check_cuda(cuEventRecord(staged_event_, stream), "model comm staging event record");
-  check_cuda(cuEventSynchronize(staged_event_), "model comm staging event wait");
+  // Pinned staging must drain to the host; device rows order on the stream.
+  if (device)
+    check_cuda(cuStreamWaitEvent(pack_stream, staged_event_, 0), "model comm staging order");
+  else
+    check_cuda(cuEventSynchronize(staged_event_), "model comm staging event wait");
 
   {
     std::unique_lock<std::mutex> lock(mutex_);
@@ -389,6 +401,12 @@ std::string ModelComm::comm_from_handler(bool forward, CUstream stream, const vo
     condition_.notify_all();
     condition_.wait(lock, [&] { return !request_pending_; });
     if (!service_error_.empty()) return service_error_;
+  }
+
+  // The service enqueued its unpack on pack_stream; execution resumes after it.
+  if (device) {
+    check_cuda(cuEventRecord(unpacked_event_, pack_stream), "model comm unpack event record");
+    check_cuda(cuStreamWaitEvent(stream, unpacked_event_, 0), "model comm unpack order");
   }
 
   if (forward) {
