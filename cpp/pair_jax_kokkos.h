@@ -48,7 +48,7 @@ class PairJaxKokkos : public Pair, public KokkosBase {
   void unpack_reverse_comm(int, int *, double *) override;
 
 #ifdef KOKKOS_ENABLE_CUDA
-  // Device variants exchange rows in place through CommKokkos buffers.
+  // Device variants exchange rows in place through Kokkos comm buffers.
   int pack_forward_comm_kokkos(int, DAT::tdual_int_1d, DAT::tdual_double_1d &, int,
                                int *) override;
   void unpack_forward_comm_kokkos(int, int, DAT::tdual_double_1d &) override;
