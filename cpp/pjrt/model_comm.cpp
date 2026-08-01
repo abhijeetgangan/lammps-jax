@@ -350,6 +350,7 @@ std::string ModelComm::comm_from_handler(bool forward, CUstream stream, const vo
 {
   int nlocal = 0;
   int nghost = 0;
+  bool device = false;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!servicing_)
@@ -358,6 +359,7 @@ std::string ModelComm::comm_from_handler(bool forward, CUstream stream, const vo
     if (!error.empty()) return error;
     nlocal = nlocal_;
     nghost = nghost_;
+    device = device_rows_;
   }
 
   const size_t row_bytes = static_cast<size_t>(width) * sizeof(float);
@@ -371,7 +373,7 @@ std::string ModelComm::comm_from_handler(bool forward, CUstream stream, const vo
                "model comm identity copy");
   // Forward sends owned rows; reverse sends owned and ghost adjoint rows.
   const int staged_rows = forward ? nlocal : nlocal + nghost;
-  if (staged_rows > 0)
+  if (!device && staged_rows > 0)
     check_cuda(cuMemcpyDtoHAsync(pinned_, input_ptr, static_cast<size_t>(staged_rows) * row_bytes,
                                  stream),
                "model comm stage to host");
@@ -380,7 +382,9 @@ std::string ModelComm::comm_from_handler(bool forward, CUstream stream, const vo
 
   {
     std::unique_lock<std::mutex> lock(mutex_);
-    request_ = ModelCommRequest{forward, pinned_, static_cast<int>(width), nlocal, nghost};
+    request_ = ModelCommRequest{forward, device ? nullptr : pinned_, static_cast<int>(width),
+                                nlocal, nghost,
+                                device ? reinterpret_cast<float *>(output) : nullptr};
     request_pending_ = true;
     condition_.notify_all();
     condition_.wait(lock, [&] { return !request_pending_; });
@@ -388,13 +392,13 @@ std::string ModelComm::comm_from_handler(bool forward, CUstream stream, const vo
   }
 
   if (forward) {
-    if (nghost > 0)
+    if (!device && nghost > 0)
       check_cuda(cuMemcpyHtoDAsync(output_ptr + static_cast<size_t>(nlocal) * row_bytes,
                                    pinned_ + static_cast<size_t>(nlocal) * width,
                                    static_cast<size_t>(nghost) * row_bytes, stream),
                  "model comm ghost rows to device");
   } else {
-    if (nlocal > 0)
+    if (!device && nlocal > 0)
       check_cuda(cuMemcpyHtoDAsync(output_ptr, pinned_,
                                    static_cast<size_t>(nlocal) * row_bytes, stream),
                  "model comm owner adjoints to device");

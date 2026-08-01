@@ -82,6 +82,9 @@ class Runtime {
   void consume_force_output(CUstream consumer_stream,
                             const std::function<void(CUdeviceptr)> &consumer);
 
+  // Null for bundles without communication.
+  ModelComm *model_comm() const { return model_comm_.get(); }
+
  private:
   ExecutionResult run_with_comm(const ExecutionRequest &request,
                                 const std::function<ExecutionResult()> &execute);

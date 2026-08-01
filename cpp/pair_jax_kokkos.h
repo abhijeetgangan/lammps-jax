@@ -8,6 +8,7 @@
 
 #include "pjrt/runtime.h"
 
+#include "kokkos_base.h"
 #include "pair.h"
 
 #include <type_traits>
@@ -29,7 +30,7 @@ namespace LAMMPS_NS {
 class AtomKokkos;
 template <class DeviceType> class NeighListKokkos;
 
-class PairJaxKokkos : public Pair {
+class PairJaxKokkos : public Pair, public KokkosBase {
  public:
   PairJaxKokkos(class LAMMPS *);
   ~PairJaxKokkos() override;
@@ -45,6 +46,15 @@ class PairJaxKokkos : public Pair {
   void unpack_forward_comm(int, int, double *) override;
   int pack_reverse_comm(int, int, double *) override;
   void unpack_reverse_comm(int, int *, double *) override;
+
+#ifdef KOKKOS_ENABLE_CUDA
+  // Device variants exchange rows in place through CommKokkos buffers.
+  int pack_forward_comm_kokkos(int, DAT::tdual_int_1d, DAT::tdual_double_1d &, int,
+                               int *) override;
+  void unpack_forward_comm_kokkos(int, int, DAT::tdual_double_1d &) override;
+  int pack_reverse_comm_kokkos(int, int, DAT::tdual_double_1d &) override;
+  void unpack_reverse_comm_kokkos(int, DAT::tdual_int_1d, DAT::tdual_double_1d &) override;
+#endif
 
  protected:
   void allocate();
@@ -67,6 +77,7 @@ class PairJaxKokkos : public Pair {
   int cached_edge_count = 0;
   // Active model-comm site state, valid only inside service_model_comm.
   float *comm_rows = nullptr;
+  float *d_comm_rows = nullptr;
   int comm_width = 0;
 
 #ifdef KOKKOS_ENABLE_CUDA

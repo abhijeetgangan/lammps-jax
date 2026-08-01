@@ -4,6 +4,8 @@
 #include "atom_kokkos.h"
 #include "atom_masks.h"
 #include "comm.h"
+#include "comm_kokkos.h"
+#include "comm_tiled_kokkos.h"
 #include "domain.h"
 #include "error.h"
 #include "fix.h"
@@ -172,6 +174,74 @@ struct VirialFDotRFunctor {
   }
 };
 
+// Model comm rows are f32; two features bit-pack per double slot, matching the host callbacks.
+struct PackCommRowsByList {
+  typename ArrayTypes<LMPDeviceType>::t_int_1d sendlist;
+  typename ArrayTypes<LMPDeviceType>::t_double_1d buf;
+  const float *rows;
+  int width;
+  int slots;
+
+  KOKKOS_INLINE_FUNCTION
+  void operator()(const int i) const
+  {
+    const float *row = rows + static_cast<size_t>(sendlist(i)) * width;
+    float *packed = reinterpret_cast<float *>(&buf(static_cast<size_t>(i) * slots));
+    for (int w = 0; w < width; ++w) packed[w] = row[w];
+    if (width & 1) packed[width] = 0.0f;
+  }
+};
+
+struct UnpackCommRowsAt {
+  typename ArrayTypes<LMPDeviceType>::t_double_1d buf;
+  float *rows;
+  int width;
+  int slots;
+  int first;
+
+  KOKKOS_INLINE_FUNCTION
+  void operator()(const int i) const
+  {
+    float *row = rows + static_cast<size_t>(first + i) * width;
+    const float *packed = reinterpret_cast<const float *>(&buf(static_cast<size_t>(i) * slots));
+    for (int w = 0; w < width; ++w) row[w] = packed[w];
+  }
+};
+
+struct PackCommRowsAt {
+  typename ArrayTypes<LMPDeviceType>::t_double_1d buf;
+  const float *rows;
+  int width;
+  int slots;
+  int first;
+
+  KOKKOS_INLINE_FUNCTION
+  void operator()(const int i) const
+  {
+    const float *row = rows + static_cast<size_t>(first + i) * width;
+    float *packed = reinterpret_cast<float *>(&buf(static_cast<size_t>(i) * slots));
+    for (int w = 0; w < width; ++w) packed[w] = row[w];
+    if (width & 1) packed[width] = 0.0f;
+  }
+};
+
+// Adjoint accumulation; sendlist indices are unique within a swap.
+struct AddCommRowsByList {
+  typename ArrayTypes<LMPDeviceType>::t_int_1d sendlist;
+  typename ArrayTypes<LMPDeviceType>::t_double_1d buf;
+  float *rows;
+  int width;
+  int slots;
+
+  KOKKOS_INLINE_FUNCTION
+  void operator()(const int i) const
+  {
+    float *row = rows + static_cast<size_t>(sendlist(i)) * width;
+    const float *packed = reinterpret_cast<const float *>(&buf(static_cast<size_t>(i) * slots));
+    for (int w = 0; w < width; ++w) row[w] += packed[w];
+  }
+};
+
 #endif
 
 } // namespace
@@ -182,6 +252,7 @@ PairJaxKokkos::PairJaxKokkos(LAMMPS *lmp) : Pair(lmp)
   kokkosable = 1;
   atomKK = (AtomKokkos *) atom;
   execution_space = ExecutionSpaceFromDevice<LMPDeviceType>::space;
+  reverse_comm_device = 1;
   datamask_read = X_MASK | F_MASK | TYPE_MASK;
   datamask_modify = F_MASK | ENERGY_MASK | VIRIAL_MASK;
   manybody_flag = 1;
@@ -263,19 +334,30 @@ static inline int comm_double_slots(int width)
   return (width + 1) / 2;
 }
 
-// Runs on the LAMMPS MPI thread while execution waits in the FFI handler; staging is pinned host.
+// Runs on the LAMMPS MPI thread while execution waits in the FFI handler.
 void PairJaxKokkos::service_model_comm(const pjrt::ModelCommRequest &request)
 {
-  comm_rows = request.host_rows;
   comm_width = request.width;
-  const ExecutionSpace saved_space = execution_space;
-  execution_space = Host;
-  if (request.forward)
-    comm->forward_comm(this, comm_double_slots(comm_width));
-  else
-    comm->reverse_comm(this, comm_double_slots(comm_width));
-  execution_space = saved_space;
-  comm_rows = nullptr;
+  if (request.device_rows) {
+    d_comm_rows = request.device_rows;
+    if (request.forward)
+      comm->forward_comm(this, comm_double_slots(comm_width));
+    else
+      comm->reverse_comm(this, comm_double_slots(comm_width));
+    // Unpack runs on the Kokkos stream; execution resumes on the model stream.
+    exec.fence();
+    d_comm_rows = nullptr;
+  } else {
+    comm_rows = request.host_rows;
+    const ExecutionSpace saved_space = execution_space;
+    execution_space = Host;
+    if (request.forward)
+      comm->forward_comm(this, comm_double_slots(comm_width));
+    else
+      comm->reverse_comm(this, comm_double_slots(comm_width));
+    execution_space = saved_space;
+    comm_rows = nullptr;
+  }
   comm_width = 0;
 }
 
@@ -324,6 +406,47 @@ void PairJaxKokkos::unpack_reverse_comm(int n, int *list, double *buf)
     for (int w = 0; w < comm_width; ++w) row[w] += packed[w];
   }
 }
+
+#ifdef KOKKOS_ENABLE_CUDA
+int PairJaxKokkos::pack_forward_comm_kokkos(int n, DAT::tdual_int_1d k_sendlist,
+                                            DAT::tdual_double_1d &k_buf, int /*pbc_flag*/,
+                                            int * /*pbc*/)
+{
+  const int slots = comm_double_slots(comm_width);
+  Kokkos::parallel_for(
+      "LAMMPSJAX::pack_forward_comm", Kokkos::RangePolicy<LMPDeviceType>(0, n),
+      PackCommRowsByList{k_sendlist.view<LMPDeviceType>(), k_buf.view<LMPDeviceType>(),
+                         d_comm_rows, comm_width, slots});
+  return n * slots;
+}
+
+void PairJaxKokkos::unpack_forward_comm_kokkos(int n, int first, DAT::tdual_double_1d &k_buf)
+{
+  const int slots = comm_double_slots(comm_width);
+  Kokkos::parallel_for(
+      "LAMMPSJAX::unpack_forward_comm", Kokkos::RangePolicy<LMPDeviceType>(0, n),
+      UnpackCommRowsAt{k_buf.view<LMPDeviceType>(), d_comm_rows, comm_width, slots, first});
+}
+
+int PairJaxKokkos::pack_reverse_comm_kokkos(int n, int first, DAT::tdual_double_1d &k_buf)
+{
+  const int slots = comm_double_slots(comm_width);
+  Kokkos::parallel_for(
+      "LAMMPSJAX::pack_reverse_comm", Kokkos::RangePolicy<LMPDeviceType>(0, n),
+      PackCommRowsAt{k_buf.view<LMPDeviceType>(), d_comm_rows, comm_width, slots, first});
+  return n * slots;
+}
+
+void PairJaxKokkos::unpack_reverse_comm_kokkos(int n, DAT::tdual_int_1d k_sendlist,
+                                               DAT::tdual_double_1d &k_buf)
+{
+  const int slots = comm_double_slots(comm_width);
+  Kokkos::parallel_for(
+      "LAMMPSJAX::unpack_reverse_comm", Kokkos::RangePolicy<LMPDeviceType>(0, n),
+      AddCommRowsByList{k_sendlist.view<LMPDeviceType>(), k_buf.view<LMPDeviceType>(),
+                        d_comm_rows, comm_width, slots});
+}
+#endif
 
 void PairJaxKokkos::settings(int narg, char **arg)
 {
@@ -434,6 +557,16 @@ void PairJaxKokkos::init_style()
                    style);
     }
   }
+  bool device_comm = false;
+  if (comm_enabled() && runtime && runtime->model_comm()) {
+    // Kokkos brick and tiled comm exchange rows in place on device; anything else
+    // stages through pinned host.
+    device_comm = (dynamic_cast<CommKokkos *>(comm) != nullptr ||
+                   dynamic_cast<CommTiledKokkos *>(comm) != nullptr) &&
+                  !lmp->kokkos->forward_pair_comm_legacy &&
+                  !lmp->kokkos->reverse_pair_comm_legacy;
+    runtime->model_comm()->set_device_rows(device_comm);
+  }
   const bool multi_hop = bundle.contract.n_hops > 1;
   if (comm->me == 0) {
     if (comm_enabled()) {
@@ -442,8 +575,10 @@ void PairJaxKokkos::init_style()
       utils::logmesg(lmp,
                      "LAMMPS-JAX: communicating bundle ({} exchange site(s), max width {}); "
                      "node features are synchronized per layer through LAMMPS "
-                     "forward/reverse communication with a one-cutoff ghost shell.\n",
-                     bundle.contract.comm_widths.size(), max_width);
+                     "forward/reverse communication with a one-cutoff ghost shell; "
+                     "rows are exchanged {}.\n",
+                     bundle.contract.comm_widths.size(), max_width,
+                     device_comm ? "in place on device" : "through pinned host staging");
     }
     else if (multi_hop)
       utils::logmesg(lmp,

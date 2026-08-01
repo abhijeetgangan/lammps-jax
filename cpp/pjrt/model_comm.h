@@ -19,13 +19,15 @@ namespace pjrt {
 
 struct ModelCommUserData;
 
-// One request, serviced on the engine's MPI thread; host_rows is pinned f32 staging.
+// One request, serviced on the engine's MPI thread; host_rows is pinned f32
+// staging, device_rows the in-place device buffer when device comm is active.
 struct ModelCommRequest {
   bool forward = true;
   float *host_rows = nullptr;
   int width = 0;
   int nlocal = 0;
   int nghost = 0;
+  float *device_rows = nullptr;
 };
 
 class ModelComm {
@@ -48,6 +50,9 @@ class ModelComm {
 
   // Per-step row counts; call before launching an execution.
   void begin_step(int nlocal, int nghost);
+
+  // Exchange in place on device rows, skipping the pinned staging.
+  void set_device_rows(bool enabled) { device_rows_ = enabled; }
 
   // Protocol: begin_service; worker executes and marks done; service_loop; worker.get.
   void begin_service();
@@ -82,6 +87,7 @@ class ModelComm {
   bool request_pending_ = false;
   std::string service_error_;
   bool servicing_ = false;
+  bool device_rows_ = false;
   bool done_ = false;
   int nlocal_ = 0;
   int nghost_ = 0;

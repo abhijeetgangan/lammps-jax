@@ -65,7 +65,7 @@ void OutputLifetime::retire_pending(CUstream consumer_stream)
 
 void OutputLifetime::collect_retired(bool wait)
 {
-  // Unprovable completion releases the buffer, a deliberate leak: destroy
+  // Unprovable completion releases the buffer, an accepted leak: destroy
   // under in-flight kernels is a device use-after-free. First failure rethrows last.
   std::vector<RetiredOutput> keep;
   CUresult first_failure = CUDA_SUCCESS;

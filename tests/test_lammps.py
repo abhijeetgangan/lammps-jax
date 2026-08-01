@@ -4,6 +4,7 @@ Runs each deck on 1 and 2 MPI ranks against dense float64 references.
 Skipped unless LAMMPS_BIN, PJRT_PLUGIN, and LAMMPS_PLUGIN_PATH are set.
 """
 
+import importlib.util
 import os
 import re
 import subprocess
@@ -81,6 +82,10 @@ EXPORTS = {
                   ("export", "plain", "{output}", "--mode", "comm", "--type-z", "13",
                    "--max-atoms", "2048", "--edges-per-atom", "16",
                    "--bundle-dir", str(MACE_MP_DIR), "--skip-check")),
+    "mace_oeq": ("export_mace.py",
+                 ("export", "oeq", "{output}", "--mode", "comm", "--type-z", "13",
+                  "--max-atoms", "2048", "--edges-per-atom", "16",
+                  "--bundle-dir", str(MACE_MP_DIR) + "-fused", "--skip-check")),
     "cuzr": ("export_model.py",
              ("eam", "{output}", "--setfl", "examples/potentials/CuZr.eam.alloy.gz",
               "--max-atoms", "8192", "--edges-per-atom", "128",
@@ -323,6 +328,8 @@ CASES = {
     "eam_nve": dict(kind="nve", deck="eam_nve", bundle="eam", dense="eam"),
     "mace_comm_nve": dict(kind="nve", deck="mace_nve", bundle="mace_comm",
                           pressure_tol=5.0e-2),
+    "mace_oeq_nve": dict(kind="nve", deck="mace_nve", bundle="mace_oeq",
+                         pressure_tol=5.0e-2),
 }
 STATIC_CASES = [name for name, spec in CASES.items() if spec["kind"] == "static"]
 NVE_CASES = [name for name, spec in CASES.items() if spec["kind"] == "nve"]
@@ -691,6 +698,7 @@ class LammpsRunner:
             self.decks[name].write_text(text)
         self.bundles = {}
         self.rank_runs = {}
+        self.shim_path = None
 
     def run(self, name, command, env=None, expect_success=True):
         command = [str(part) for part in command]
@@ -717,12 +725,51 @@ class LammpsRunner:
             )
         return screen.read_text()
 
+    def shim(self):
+        """The replay shim library, built on first use."""
+        if self.shim_path is None:
+            source = REPO_ROOT / "contrib" / "ffi-replay" / "ffi_replay_shim.c"
+            path = self.out_dir / "ffi_replay_shim.so"
+            try:
+                build = subprocess.run(
+                    ["gcc", "-shared", "-fPIC", "-O2", "-o", path, source,
+                     "-ldl", "-lpthread", "-l:libffi.so.8"],
+                    capture_output=True, text=True, check=False,
+                )
+            except OSError:
+                pytest.skip("gcc not available")
+            if build.returncode != 0:
+                pytest.skip(
+                    f"cannot build ffi_replay_shim.so: {build.stderr.strip()}")
+            self.shim_path = path
+        return self.shim_path
+
+    def sidecar_env(self, bundle_path):
+        """Environment from the bundle's .env sidecar, empty without one."""
+        env_path = Path(f"{bundle_path}.env")
+        if not env_path.exists():
+            return {}
+        values = {}
+        for line in env_path.read_text().splitlines():
+            key, sep, value = line.removeprefix("export ").partition("=")
+            if not sep or not key:
+                continue
+            values[key] = value.strip("'").replace(
+                "/path/ffi_replay_shim.so", str(self.shim()))
+        return values
+
     def bundle(self, name):
         """The bundle path for `name`, exporting it on first use."""
         if name not in self.bundles:
             script, arguments = EXPORTS[name]
-            if script == "export_mace.py" and not (MACE_MP_DIR / "config.json").exists():
-                pytest.skip("converted MACE-MP bundle not available")
+            if script == "export_mace.py":
+                bundle_dir = MACE_MP_DIR
+                if "--bundle-dir" in arguments:
+                    bundle_dir = Path(arguments[arguments.index("--bundle-dir") + 1])
+                if not (bundle_dir / "config.json").exists():
+                    pytest.skip("converted MACE-MP bundle not available")
+            if "oeq" in arguments and importlib.util.find_spec("openequivariance") is None:
+                pytest.skip("openequivariance not available")
             path = self.out_dir / f"{name}.lammps-jax.json"
             env = dict(self.env)
             env["JAX_ENABLE_X64"] = "0"
@@ -732,7 +779,8 @@ class LammpsRunner:
             self.bundles[name] = path
         return self.bundles[name]
 
-    def lammps(self, name, deck, newton, nprocs, variables, expect_success=True):
+    def lammps(self, name, deck, newton, nprocs, variables, extra_env=None,
+               expect_success=True):
         command = [self.mpirun, "-np", str(nprocs)]
         if self.oversubscribe:
             command.append("--oversubscribe")
@@ -748,7 +796,8 @@ class LammpsRunner:
         ]
         for key, value in variables.items():
             command += ["-var", key, value]
-        return self.run(name, command, expect_success=expect_success)
+        env = {**self.env, **extra_env} if extra_env else None
+        return self.run(name, command, env=env, expect_success=expect_success)
 
     def rank_pair(self, case):
         """Frames and screens of `case` on 1 and 2 ranks, run on first use."""
@@ -759,13 +808,15 @@ class LammpsRunner:
             for nprocs in (1, 2):
                 tag = f"{case}_np{nprocs}"
                 dump_path = self.out_dir / f"{tag}.dump"
+                bundle_path = self.bundle(spec["bundle"])
                 screens[nprocs] = self.lammps(
                     tag,
                     self.decks[spec["deck"]],
                     newton=spec.get("newton", "on"),
                     nprocs=nprocs,
-                    variables={"bundle": self.bundle(spec["bundle"]),
+                    variables={"bundle": bundle_path,
                                "dump_path": dump_path},
+                    extra_env=self.sidecar_env(bundle_path),
                 )
                 grid = re.search(r"(\d+) by (\d+) by (\d+) MPI processor grid",
                                  screens[nprocs])
