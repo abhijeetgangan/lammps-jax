@@ -9,9 +9,11 @@ description = "CUDA-first LAMMPS/Kokkos plugin support for exported JAX models"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
+# Comm bundles need the plugin's FFI registration from 0.10.0; the 0.10.2
+# plugin slows GPU scatter-add about 4x, so run 0.10.1.
 dependencies = [
   "jax>=0.8",
-  "jaxlib>=0.8",
+  "jaxlib>=0.8,!=0.10.2",
 ]
 
 [project.optional-dependencies]

@@ -8,7 +8,8 @@ import argparse
 import jax
 import jax.numpy as jnp
 
-from lammps_jax.eam import load_funcfl, load_setfl, make_eam_energy, make_setfl_energy
+from lammps_jax.eam import (load_funcfl, load_setfl, make_eam_energy,
+                            make_setfl_edge_force, make_setfl_energy)
 from lammps_jax.export import export_model
 
 
@@ -144,8 +145,11 @@ def export_lj(args, max_edges):
 
 def export_eam(args, max_edges, parser):
     communicating = args.mode == "comm"
+    force_fn = None
     if args.setfl is not None and args.funcfl is not None:
         parser.error("--setfl and --funcfl are mutually exclusive")
+    if args.force_output == "edge" and args.setfl is None and args.funcfl is None:
+        parser.error("--force-output edge requires a tabulated potential")
     if args.setfl is not None or args.funcfl is not None:
         table_path = args.setfl if args.setfl is not None else args.funcfl
         tables = load_setfl(args.setfl) if args.setfl else load_funcfl(args.funcfl)
@@ -153,6 +157,9 @@ def export_eam(args, max_edges, parser):
               f"cutoff {tables['cutoff']:.6f}")
         energy_fn = make_setfl_energy(tables, communicating=communicating,
                                       half_edges=args.half_edges)
+        if args.force_output == "edge":
+            force_fn = make_setfl_edge_force(tables, communicating=communicating,
+                                             half_edges=args.half_edges)
         cutoff = tables["cutoff"]
         unit_style = "metal"
         n_species = len(tables["elements"])
@@ -171,12 +178,15 @@ def export_eam(args, max_edges, parser):
         n_species = None
     export_model(
         energy_fn=energy_fn,
+        force_fn=force_fn,
         path=args.output,
         max_atoms=args.max_atoms,
         max_edges=max_edges,
         cutoff=cutoff,
         unit_style=unit_style,
         precision=args.precision,
+        force_output="edge-force" if force_fn is not None else "atom-force",
+        newton="on" if force_fn is not None else "any",
         comm=communicating,
         n_hops=1 if communicating else 2,
         half_edges=args.half_edges,
@@ -212,6 +222,11 @@ def main() -> None:
     eam = subparsers.add_parser(
         "eam", help="Analytic Finnis-Sinclair or a tabulated DYNAMO potential.")
     add_shared_arguments(eam, max_atoms=4096, edges_per_atom=64)
+    eam.add_argument(
+        "--force-output", choices=("atom", "edge"), default="atom",
+        help="atom: forces by autodiff of the summed energy; edge: per-edge "
+             "pair forces with the density exchanged in the model, newton on.",
+    )
     eam.add_argument(
         "--cutoff", type=float, default=1.6,
         help="Cutoff radius of the analytic model; tabulated exports take "

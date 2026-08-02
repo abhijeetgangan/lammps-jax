@@ -113,11 +113,12 @@ def spline_coefficients(table: np.ndarray) -> np.ndarray:
     return np.stack([f, d, c2, c3], axis=-1)
 
 
-def spline_lookup(tables, table_ids, x, delta, extrapolate=False):
+def spline_lookup(tables, table_ids, x, delta, extrapolate=False, derivative=False):
     """Evaluate stacked spline tables at x, selecting a table per element.
 
     Out-of-range points saturate at the end value unless `extrapolate`
     continues linearly with the end slope, matching pair_eam past rhomax.
+    `derivative` returns d/dx instead of the value.
     """
     dtype = x.dtype
     n = tables.shape[-2]
@@ -126,6 +127,13 @@ def spline_lookup(tables, table_ids, x, delta, extrapolate=False):
     t_raw = idx - node.astype(dtype)
     t = jnp.minimum(t_raw, jnp.asarray(1.0, dtype))
     c = tables[table_ids, node]
+    if derivative:
+        slope = c[..., 1] + t * (2.0 * c[..., 2] + t * (3.0 * c[..., 3]))
+        if extrapolate:
+            # Past the table the linear continuation keeps the end slope.
+            end_slope = c[..., 1] + 2.0 * c[..., 2] + 3.0 * c[..., 3]
+            slope = jnp.where(t_raw > t, end_slope, slope)
+        return slope / jnp.asarray(delta, dtype)
     value = c[..., 0] + t * (c[..., 1] + t * (c[..., 2] + t * c[..., 3]))
     if not extrapolate:
         return value
@@ -286,3 +294,69 @@ def make_setfl_energy(tables: dict, *, communicating: bool = False,
         return node_energies(positions, species, graph)
 
     return plain_energy
+
+
+def make_setfl_edge_force(tables: dict, *, communicating: bool = False,
+                          half_edges: bool = False) -> Callable[..., Any]:
+    """Per-edge eam/alloy forces; the pair style scatters them to the endpoints.
+
+    Returns the force on the sender, psip/r * rij with rij pointing at the
+    receiver, matching PairEAM::compute. Communicating exports exchange the
+    completed density so ghost rows embed with their owner's value.
+    """
+    cutoff = tables["cutoff"]
+
+    def edge_forces(positions, species, graph, comm=None):
+        dtype = positions.dtype
+        embedding = jnp.asarray(tables["embedding"], dtype)
+        density_tables = jnp.asarray(tables["density"], dtype)
+        pair_tables = jnp.asarray(tables["pair"], dtype)
+        pair_index = jnp.asarray(tables["pair_index"])
+        cutoff_sq = jnp.asarray(cutoff * cutoff, dtype)
+        zero = jnp.asarray(0.0, dtype)
+        one = jnp.asarray(1.0, dtype)
+
+        safe_senders = jnp.where(graph.edge_mask, graph.senders, 0)
+        safe_receivers = jnp.where(graph.edge_mask, graph.receivers, 0)
+        rij = positions[safe_receivers] - positions[safe_senders]
+        r_sq = jnp.sum(rij * rij, axis=-1)
+        valid = graph.edge_mask & (r_sq < cutoff_sq)
+        r = jnp.sqrt(jnp.where(valid, r_sq, one))
+        sender_species = species[safe_senders]
+        receiver_species = species[safe_receivers]
+
+        n_atoms = positions.shape[0]
+        zeros = jnp.zeros((n_atoms,), dtype=dtype)
+        rho_edge = spline_lookup(density_tables, receiver_species, r, tables["dr"])
+        density = zeros.at[safe_senders].add(jnp.where(valid, rho_edge, zero))
+        if half_edges:
+            rho_reverse = spline_lookup(density_tables, sender_species, r, tables["dr"])
+            density = density.at[safe_receivers].add(jnp.where(valid, rho_reverse, zero))
+        if comm is not None:
+            density = comm.forward_comm(density)
+
+        fp = spline_lookup(embedding, species, density, tables["drho"],
+                           extrapolate=True, derivative=True)
+        rhojp = spline_lookup(density_tables, receiver_species, r, tables["dr"],
+                              derivative=True)
+        rhoip = spline_lookup(density_tables, sender_species, r, tables["dr"],
+                              derivative=True)
+        pair_ids = pair_index[sender_species, receiver_species]
+        z2 = spline_lookup(pair_tables, pair_ids, r, tables["dr"])
+        z2p = spline_lookup(pair_tables, pair_ids, r, tables["dr"], derivative=True)
+        phi = z2 / r
+        phip = (z2p - phi) / r
+        psip = fp[safe_senders] * rhojp + fp[safe_receivers] * rhoip + phip
+        scale = jnp.where(valid, psip / r, zero)
+        return scale[:, None] * rij
+
+    if communicating:
+        def comm_forces(positions, species, graph, comm):
+            return edge_forces(positions, species, graph, comm)
+
+        return comm_forces
+
+    def plain_forces(positions, species, graph):
+        return edge_forces(positions, species, graph)
+
+    return plain_forces

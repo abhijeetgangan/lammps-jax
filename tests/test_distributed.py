@@ -69,10 +69,10 @@ def test_comm_records_and_validates_widths():
     with pytest.raises(ValueError, match="width 5, expected 2"):
         checked.forward_comm(jnp.ones((4, 5)))
 
-    incomplete = comm.Comm(enabled=False, expected_widths=(3, 2))
-    incomplete.forward_comm(jnp.ones((4, 3)))
-    with pytest.raises(ValueError, match="observed widths"):
-        incomplete.validate()
+    # A program may visit a leading subset of the bundle schedule.
+    prefix = comm.Comm(enabled=False, expected_widths=(3, 2))
+    prefix.forward_comm(jnp.ones((4, 3)))
+    prefix.validate()
 
 
 # Export wiring

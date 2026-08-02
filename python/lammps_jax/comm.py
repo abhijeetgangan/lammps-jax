@@ -166,11 +166,17 @@ class Comm:
         return jax.tree.unflatten(treedef, pieces)
 
     def validate(self) -> None:
-        """Check that the trace visited the full declared schedule in order."""
+        """Check that the trace visited a prefix of the declared schedule in order.
+
+        A bundle's programs share one schedule; a program with fewer exchange
+        sites than the fused one visits a leading subset.
+        """
         if self.expected_widths is None:
             return
-        if tuple(self.widths) != self.expected_widths:
+        observed = tuple(self.widths)
+        if observed != self.expected_widths[: len(observed)]:
             raise ValueError(
                 "comm exchange schedule mismatch: observed widths "
-                f"{list(self.widths)}, expected {list(self.expected_widths)}"
+                f"{list(self.widths)}, expected a prefix of "
+                f"{list(self.expected_widths)}"
             )

@@ -132,6 +132,9 @@ struct AddEdgeForcesFunctor {
   Kokkos::View<int *, DeviceType> senders;
   Kokkos::View<int *, DeviceType> receivers;
   bool newton_pair;
+  // Half-edge packing keeps boundary pairs on both ranks; each copy adds half.
+  bool halve_ghost_pairs;
+  int nlocal;
   double scale;
 
   KOKKOS_INLINE_FUNCTION
@@ -139,14 +142,16 @@ struct AddEdgeForcesFunctor {
   {
     // Senders are owned atoms: edges come from local-list rows 0..inum-1 in both newton modes.
     const int i = senders(edge);
-    const KK_ACC_FLOAT fx = static_cast<KK_ACC_FLOAT>(scale * edge_forces(edge, 0));
-    const KK_ACC_FLOAT fy = static_cast<KK_ACC_FLOAT>(scale * edge_forces(edge, 1));
-    const KK_ACC_FLOAT fz = static_cast<KK_ACC_FLOAT>(scale * edge_forces(edge, 2));
+    const int j = receivers(edge);
+    const double weight =
+        (newton_pair && halve_ghost_pairs && j >= nlocal) ? 0.5 * scale : scale;
+    const KK_ACC_FLOAT fx = static_cast<KK_ACC_FLOAT>(weight * edge_forces(edge, 0));
+    const KK_ACC_FLOAT fy = static_cast<KK_ACC_FLOAT>(weight * edge_forces(edge, 1));
+    const KK_ACC_FLOAT fz = static_cast<KK_ACC_FLOAT>(weight * edge_forces(edge, 2));
     Kokkos::atomic_add(&f(i, 0), fx);
     Kokkos::atomic_add(&f(i, 1), fy);
     Kokkos::atomic_add(&f(i, 2), fz);
     if (newton_pair) {
-      const int j = receivers(edge);
       Kokkos::atomic_add(&f(j, 0), -fx);
       Kokkos::atomic_add(&f(j, 1), -fy);
       Kokkos::atomic_add(&f(j, 2), -fz);
@@ -791,7 +796,8 @@ void PairJaxKokkos::add_model_forces_as(CUdeviceptr force_output, const PairJaxK
         "LAMMPSJAX::add_edge_forces",
         Kokkos::RangePolicy<LMPDeviceType>(exec, 0, cached_edge_count),
         AddEdgeForcesFunctor<LMPDeviceType, Scalar>{f, edge_forces, d_senders, d_receivers,
-                                                    static_cast<bool>(force->newton_pair), scale});
+                                                    static_cast<bool>(force->newton_pair),
+                                                    bundle.contract.half_edges, nlocal, scale});
   } else {
     ForceView model_forces(reinterpret_cast<const Scalar *>(force_output), bundle.contract.max_atoms);
     const int limit = force->newton_pair ? nall : nlocal;

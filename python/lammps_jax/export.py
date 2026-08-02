@@ -244,10 +244,11 @@ def export_model(
             "force contributions of a direct force_fn have no defined convention"
         )
     if comm:
-        if force_fn is not None:
+        if force_fn is not None and force_output != EDGE_FORCE:
             raise ValueError(
-                "communicating exports require autodiff forces from energy_fn; "
-                "the reverse exchange is the VJP of the forward exchange"
+                "communicating exports take autodiff forces from energy_fn or "
+                "per-edge forces; a direct atom force_fn has no ghost-row "
+                "convention"
             )
         if n_hops != 1:
             raise ValueError(
@@ -308,12 +309,15 @@ def export_model(
             value = model_fn(positions, species, graph, *extra)
         return value, graph, nlocal, nghost
 
-    # Staging buffers are sized from this identity-exchange width trace.
+    # Staging is sized from this width trace; per-callable schedules concatenate.
     comm_widths: tuple[int, ...] = ()
     if comm:
-        recorder = Comm(enabled=False)
-        jax.eval_shape(lambda *a: call_model_with(energy_fn, a, recorder)[0], *args)  # ty: ignore[invalid-argument-type]
-        comm_widths = tuple(recorder.widths)
+        for fn in (energy_fn, force_fn):
+            if fn is None:
+                continue
+            recorder = Comm(enabled=False)
+            jax.eval_shape(lambda *a, fn=fn: call_model_with(fn, a, recorder)[0], *args)  # ty: ignore[invalid-argument-type]
+            comm_widths += tuple(recorder.widths)
         if not comm_widths:
             raise ValueError(
                 "comm=True but the model never called comm.forward_comm; export "

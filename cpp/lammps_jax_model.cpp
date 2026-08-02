@@ -257,11 +257,10 @@ ModelBundle load_bundle_file(const std::string &path)
   for (const int width : bundle.contract.comm_widths)
     if (width <= 0) throw std::runtime_error("Invalid communication width in bundle");
   if (!bundle.contract.comm_widths.empty() &&
-      (bundle.contract.newton != NewtonMode::On ||
-       bundle.contract.force_layout != ForceLayout::Atom || bundle.contract.n_hops != 1))
+      (bundle.contract.newton != NewtonMode::On || bundle.contract.n_hops != 1))
     throw std::runtime_error(
-        "Communicating bundles require newton on, atom-force output, and a one-cutoff "
-        "ghost shell (n_hops = 1)");
+        "Communicating bundles require newton on and a one-cutoff ghost shell "
+        "(n_hops = 1)");
   if (!bundle.contract.comm_widths.empty() && bundle.contract.precision == Precision::Float64)
     throw std::runtime_error(
         "float64 communicating bundles are not supported: the in-program feature "
