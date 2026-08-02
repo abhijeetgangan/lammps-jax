@@ -75,6 +75,32 @@ def test_comm_records_and_validates_widths():
     prefix.validate()
 
 
+def test_exchange_differentiates_in_every_mode():
+    """The exchange primitives are linear, so all AD modes compose: tangents
+    ride a forward exchange, cotangents the adjoint reverse exchange."""
+
+    def energy(x):
+        c = comm.Comm(enabled=True)
+        y = c.forward_comm(x)
+        return jnp.sum(y * y)
+
+    spec = jax.ShapeDtypeStruct((4, 3), jnp.float32)
+
+    def exchange_targets(fn, *specs):
+        text = jax.jit(fn).lower(*specs).as_text()
+        return comm.FORWARD_TARGET in text, comm.REVERSE_TARGET in text
+
+    assert exchange_targets(jax.grad(energy), spec) == (True, True)
+    jvp = lambda x, v: jax.jvp(energy, (x,), (v,))[1]
+    assert exchange_targets(jvp, spec, spec) == (True, False)
+    hvp = lambda x, v: jax.jvp(jax.grad(energy), (x,), (v,))[1]
+    assert exchange_targets(hvp, spec, spec) == (True, True)
+    grad_of_grad = lambda x, v: jax.grad(
+        lambda y: jnp.vdot(jax.grad(energy)(y), v)
+    )(x)
+    assert exchange_targets(grad_of_grad, spec, spec) == (True, True)
+
+
 # Export wiring
 
 

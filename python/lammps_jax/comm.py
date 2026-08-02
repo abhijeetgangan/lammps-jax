@@ -2,14 +2,19 @@
 
 `Comm.forward_comm` lowers to the ``lammps_jax.forward_comm`` FFI custom call, filling
 ghost rows from owner ranks; a threaded float32 token keeps exchanges ordered under XLA.
+Exchanges are linear primitives whose transposes swap forward and reverse, so every
+differentiation mode composes.
 """
 
 import math
 from collections.abc import Sequence
+from functools import partial
 from typing import Any
 
 import jax
+import jax.extend.core
 import jax.numpy as jnp
+from jax.interpreters import ad, mlir
 
 FORWARD_TARGET = "lammps_jax.forward_comm"
 REVERSE_TARGET = "lammps_jax.reverse_comm"
@@ -55,7 +60,7 @@ def comm_width(features: Any) -> int:
 
     Float32 columns packed per atom row: sum over leaves of trailing-dimension products.
     """
-    _leaves, _treedef, _n_rows, leaf_widths = flatten_features(features)
+    leaf_widths = flatten_features(features)[3]
     return int(sum(leaf_widths))
 
 
@@ -68,41 +73,63 @@ def forward_comm(features: Any) -> Any:
     return features
 
 
-def exchange_call(target: str, matrix: jax.Array, token: jax.Array):
-    """Emit one comm custom call: (matrix, token) -> (matrix, token).
+def exchange_jvp(primitive, primals, tangents):
+    # The exchange is linear: tangents travel through the same exchange.
+    matrix_dot, token_dot = tangents
+    outs = primitive.bind(*primals)
+    if type(matrix_dot) is ad.Zero and type(token_dot) is ad.Zero:
+        return outs, tuple(ad.Zero(out.aval.to_tangent_aval()) for out in outs)
+    tangent_outs = primitive.bind(
+        ad.instantiate_zeros(matrix_dot), ad.instantiate_zeros(token_dot)
+    )
+    return outs, tangent_outs
+
+
+def exchange_transpose(adjoint, cotangents, matrix, token):
+    # The token cotangent keeps transposed sites in mirror order.
+    matrix_cotangent, token_cotangent = map(ad.instantiate_zeros, cotangents)
+    out_matrix, out_token = adjoint.bind(matrix_cotangent, token_cotangent)
+    return (
+        out_matrix if ad.is_undefined_primal(matrix) else None,
+        out_token if ad.is_undefined_primal(token) else None,
+    )
+
+
+def make_exchange_primitive(name: str, target: str):
+    """Define one comm custom call primitive: (matrix, token) -> (matrix, token).
 
     Inputs alias outputs; when XLA must copy a still-live buffer, the handler
     falls back to a full identity copy.
     """
-    call = jax.ffi.ffi_call(
-        target,
-        (
-            jax.ShapeDtypeStruct(matrix.shape, matrix.dtype),
-            jax.ShapeDtypeStruct(token.shape, token.dtype),
-        ),
-        input_output_aliases={0: 0, 1: 1},
+    primitive = jax.extend.core.Primitive(name)
+    primitive.multiple_results = True
+    primitive.def_abstract_eval(lambda matrix, token: (matrix, token))
+    primitive.def_impl(jax.jit(lambda matrix, token: primitive.bind(matrix, token)))
+    mlir.register_lowering(
+        primitive, jax.ffi.ffi_lowering(target, operand_output_aliases={0: 0, 1: 1})
     )
-    matrix_out, token_out = call(matrix, token)
-    return matrix_out, token_out
+    ad.primitive_jvps[primitive] = partial(exchange_jvp, primitive)
+    return primitive
 
 
-@jax.custom_vjp
+forward_exchange_p = make_exchange_primitive("forward_exchange", FORWARD_TARGET)
+reverse_exchange_p = make_exchange_primitive("reverse_exchange", REVERSE_TARGET)
+ad.primitive_transposes[forward_exchange_p] = partial(
+    exchange_transpose, reverse_exchange_p
+)
+ad.primitive_transposes[reverse_exchange_p] = partial(
+    exchange_transpose, forward_exchange_p
+)
+
+
 def forward_exchange(matrix: jax.Array, token: jax.Array):
-    return exchange_call(FORWARD_TARGET, matrix, token)
+    """Fill ghost rows of a [n_rows, width] float32 matrix from owner ranks."""
+    return forward_exchange_p.bind(matrix, token)
 
 
-def forward_exchange_fwd(matrix: jax.Array, token: jax.Array):
-    return forward_exchange(matrix, token), None
-
-
-def forward_exchange_bwd(_residuals, cotangents):
-    # Reverse comm: sum ghost cotangents into owner rows and zero the ghosts.
-    # The threaded token cotangent keeps backward sites in mirror order.
-    matrix_cotangent, token_cotangent = cotangents
-    return exchange_call(REVERSE_TARGET, matrix_cotangent, token_cotangent)
-
-
-forward_exchange.defvjp(forward_exchange_fwd, forward_exchange_bwd)
+def reverse_exchange(matrix: jax.Array, token: jax.Array):
+    """Sum ghost rows into owner rows and zero the ghosts."""
+    return reverse_exchange_p.bind(matrix, token)
 
 
 class Comm:
@@ -120,12 +147,13 @@ class Comm:
             None if expected_widths is None else tuple(int(w) for w in expected_widths)
         )
         self.widths: list[int] = []
-        self._token: jax.Array | None = None
+        self.token: jax.Array | None = None
 
     def forward_comm(self, features: Any) -> Any:
         """Exchange one pytree of per-atom features, filling ghost rows from owner ranks.
 
-        Differentiable: the VJP is a reverse exchange of the cotangent.
+        Linear in the features: differentiating in any mode emits the adjoint
+        reverse exchange for cotangents and a forward exchange for tangents.
         """
         leaves, treedef, n_rows, leaf_widths = flatten_features(features)
         width = int(sum(leaf_widths))
@@ -151,9 +179,9 @@ class Comm:
             for leaf, leaf_width in zip(leaves, leaf_widths)
         ]
         matrix = columns[0] if len(columns) == 1 else jnp.concatenate(columns, axis=1)
-        if self._token is None:
-            self._token = jnp.zeros((), dtype=jnp.float32)
-        matrix, self._token = forward_exchange(matrix, self._token)
+        if self.token is None:
+            self.token = jnp.zeros((), dtype=jnp.float32)
+        matrix, self.token = forward_exchange(matrix, self.token)
 
         pieces = []
         offset = 0
