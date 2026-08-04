@@ -13,7 +13,9 @@ from helpers import (
     FEATURE_WIDTH,
     N_SPECIES,
     Graph,
+    UniqueLookupComm,
     assert_comm_scheme_matches_reference,
+    assert_unique_comm_matches_reference,
     call_model,
     edges_within_cutoff,
     export_and_load,
@@ -22,14 +24,21 @@ from helpers import (
     random_system,
     toy_mp_params,
     two_domains,
+    unique_half_domains,
     zero_force_fn,
 )
 from lammps_jax import comm
-from lammps_jax.eam import make_eam_energy
+from lammps_jax.eam import (
+    load_setfl,
+    make_eam_energy,
+    make_setfl_edge_force,
+    make_setfl_energy,
+)
 from lammps_jax.export import (
     BUNDLE_FORMAT,
     DISTRIBUTED_BUNDLE_FORMAT,
     HALF_EDGE_BUNDLE_FORMAT,
+    export_model,
     program_text,
     wrap_energy_fn,
 )
@@ -99,6 +108,21 @@ def test_exchange_differentiates_in_every_mode():
         lambda y: jnp.vdot(jax.grad(energy)(y), v)
     )(x)
     assert exchange_targets(grad_of_grad, spec, spec) == (True, True)
+    assert exchange_targets(jax.jacfwd(jax.grad(energy)), spec) == (True, True)
+
+
+def test_exchange_batches_by_widening():
+    """vmap folds the batch into the width: the handler forwards whole rows,
+    so one wider exchange replaces a batch of exchanges."""
+
+    def exchanged(x):
+        c = comm.Comm(enabled=True)
+        return c.forward_comm(x)
+
+    spec = jax.ShapeDtypeStruct((5, 4, 3), jnp.float32)
+    text = jax.jit(jax.vmap(exchanged)).lower(spec).as_text()
+    assert text.count(comm.FORWARD_TARGET) == 1
+    assert "tensor<4x15xf32>" in text
 
 
 # Export wiring
@@ -161,6 +185,51 @@ def test_export_communicating_bundle(tmp_path):
         assert comm.REVERSE_TARGET in text
 
 
+def width1_forward(positions, species, graph, c):
+    return c.forward_comm(jnp.sum(positions * positions, axis=1))
+
+
+def width3_forward_edges(positions, species, graph, c):
+    c.forward_comm(positions)
+    return jnp.zeros((graph.senders.shape[0], 3), positions.dtype)
+
+
+def reverse1_then_forward3(positions, species, graph, c):
+    density = c.reverse_comm(jnp.sum(positions * positions, axis=1))
+    return density + jnp.sum(c.forward_comm(positions), axis=1)
+
+
+def vmapped_forward(positions, species, graph, c):
+    stacked = jnp.stack([positions, positions], axis=1)
+    exchanged = jax.vmap(c.forward_comm, in_axes=1, out_axes=1)(stacked)
+    return jnp.sum(exchanged, axis=(1, 2))
+
+
+@pytest.mark.parametrize(("kwargs", "match"), [
+    # Separate callables carry independent token chains: one width only.
+    (dict(energy_fn=width1_forward, force_fn=width3_forward_edges,
+          force_output="edge-force", half_edges=True),
+     "separate energy and force callables"),
+    # Full pairing packs both directions; the newton scatter doubles forces.
+    (dict(energy_fn=width1_forward, force_fn=width3_forward_edges,
+          force_output="edge-force"), "double every force"),
+    # Reverse sites validate mirrored from the schedule end: one width only.
+    (dict(energy_fn=reverse1_then_forward3), "reverse exchanges need"),
+    # Unique packing needs ghost partials reverse-communicated first.
+    (dict(energy_fn=width1_forward, half_edges=True), "reverse-communicate"),
+    # vmap folds the batch into the width; the schedule cannot express it.
+    (dict(energy_fn=vmapped_forward), "fold the batch"),
+    # max_owned beyond the row capacity can never hold at runtime.
+    (dict(energy_fn=width1_forward, max_owned=999), "max_owned needs"),
+])
+def test_export_rejects_invalid_comm_schedule(tmp_path, kwargs, match):
+    with pytest.raises(ValueError, match=match):
+        export_model(
+            path=tmp_path / "rejected.json", max_atoms=8, max_edges=16,
+            cutoff=CUTOFF, unit_style="lj", comm=True, newton="on", **kwargs,
+        )
+
+
 def test_export_half_edge_bundle(tmp_path):
     """Half-edge exports carry the half-edge format tag and the pairing key, so
     loaders that pack both directions reject them instead of double
@@ -189,11 +258,12 @@ def test_export_half_edge_bundle(tmp_path):
         unit_style="lj",
         comm=True,
         half_edges=True,
+        newton="on",
     )
     assert comm_data["format"] == HALF_EDGE_BUNDLE_FORMAT
-    assert comm_data["contract"]["edge_pairing"] == "half"
+    assert comm_data["contract"]["edge_pairing"] == "half-unique"
     assert comm_data["contract"]["comm_widths"] == [1]
-    assert comm.FORWARD_TARGET in program_text(comm_data, "energy_mlir")
+    assert comm.REVERSE_TARGET in program_text(comm_data, "energy_mlir")
 
 
 def scalar_energy(positions, species, graph):
@@ -224,6 +294,8 @@ def never_communicates(positions, species, graph, comm_obj):
         (dict(comm=True, energy_fn=never_communicates),
          "never called comm.forward_comm"),
         (dict(half_edges=True, energy_fn=pair_energy), "half_edges requires"),
+        (dict(energy_fn=pair_energy, max_owned=4),
+         "max_owned needs a communicating"),
         (
             dict(
                 comm=True,
@@ -361,3 +433,87 @@ def test_comm_scheme_matches_reference(model, exchange, should_match):
         atol=5e-4,
         scale_force_atol=model == "eam",
     )
+
+
+@pytest.mark.parametrize("pair_embedding", [0.0, 0.3])
+def test_unique_boundary_matches_reference(pair_embedding):
+    """Communicating half-edge packing: every pair on one rank, ghost density
+    partials reverse-communicated to owners. The cross term couples the energy
+    to both exchanges, so a wrong adjoint cannot pass."""
+    positions_np = random_system(seed=3)
+    species_np = np.random.default_rng(5).integers(0, 2, size=len(positions_np))
+    energy_fn = make_eam_energy(cutoff=CUTOFF, communicating=True,
+                                half_edges=True,
+                                pair_embedding=pair_embedding)
+    reference_fn = make_eam_energy(cutoff=CUTOFF, pair_embedding=pair_embedding)
+    assert_unique_comm_matches_reference(
+        energy_fn, reference_fn, positions_np, species_np,
+        cutoff=CUTOFF, atol=5e-4,
+    )
+
+
+def cuzr_cluster(tables, n_x=8, n_y=4, n_z=3, spacing=2.5):
+    grid = np.stack(
+        np.meshgrid(np.arange(n_x), np.arange(n_y), np.arange(n_z),
+                    indexing="ij"), -1
+    ).reshape(-1, 3).astype(np.float64)
+    rng = np.random.default_rng(11)
+    positions = (grid * spacing + rng.random((len(grid), 3)) * 0.4).astype(np.float32)
+    species = rng.integers(0, 2, size=len(grid))
+    return positions, species
+
+
+def test_unique_boundary_setfl_matches_dense():
+    tables = load_setfl("examples/potentials/CuZr.eam.alloy.gz")
+    cutoff = tables["cutoff"]
+    positions_np, species_np = cuzr_cluster(tables)
+    energy_fn = make_setfl_energy(tables, communicating=True, half_edges=True)
+    reference_fn = make_setfl_energy(tables)
+    # Measured: dE bit-equal, dF 1.05e-5 on 12.7 eV/A peak force.
+    assert_unique_comm_matches_reference(
+        energy_fn, reference_fn, positions_np, species_np,
+        cutoff=cutoff, atol=2e-4, x_split=10.0,
+    )
+
+
+def test_unique_boundary_setfl_edge_forces_match_dense():
+    """Edge forces under unique packing, scattered +sender/-receiver and
+    summed to owners by global id, against the dense autodiff reference."""
+    tables = load_setfl("examples/potentials/CuZr.eam.alloy.gz")
+    cutoff = tables["cutoff"]
+    positions_np, species_np = cuzr_cluster(tables)
+    n_atoms = len(positions_np)
+    positions = jnp.asarray(positions_np)
+    species = jnp.asarray(species_np, dtype=jnp.int32)
+
+    edge_fn = make_setfl_edge_force(tables, communicating=True, half_edges=True)
+    domains = unique_half_domains(positions_np, 10.0, cutoff)
+    from helpers import RecordingComm
+
+    partials = []
+    for present, _n_owned, senders, receivers in domains:
+        recorder = RecordingComm()
+        edge_fn(positions[jnp.asarray(present)], species[jnp.asarray(present)],
+                Graph(senders, receivers), recorder)
+        partials.append(recorder.recorded[0])
+    global_density = jnp.zeros((n_atoms,), partials[0].dtype)
+    for (present, _n, _s, _r), part in zip(domains, partials):
+        global_density = global_density.at[jnp.asarray(present)].add(part)
+
+    forces = np.zeros((n_atoms, 3))
+    for present, n_owned, senders, receivers in domains:
+        stub = UniqueLookupComm(global_density, present, n_owned)
+        edge_f = np.asarray(edge_fn(
+            positions[jnp.asarray(present)], species[jnp.asarray(present)],
+            Graph(senders, receivers), stub,
+        ))
+        np.add.at(forces, present[senders], edge_f)
+        np.add.at(forces, present[receivers], -edge_f)
+
+    full_senders, full_receivers = edges_within_cutoff(positions_np, cutoff)
+    reference_fn = make_setfl_energy(tables)
+    ref_forces = -np.asarray(jax.grad(
+        lambda p: jnp.sum(reference_fn(p, species, Graph(full_senders, full_receivers)))
+    )(positions))
+    np.testing.assert_allclose(forces, ref_forces,
+                               atol=2e-4 * (np.max(np.abs(ref_forces)) + 1.0))

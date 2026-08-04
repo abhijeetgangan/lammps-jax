@@ -186,7 +186,8 @@ def export_eam(args, max_edges, parser):
         unit_style=unit_style,
         precision=args.precision,
         force_output="edge-force" if force_fn is not None else "atom-force",
-        newton="on" if force_fn is not None else "any",
+        newton=("on" if force_fn is not None or (communicating and args.half_edges)
+                else "any"),
         comm=communicating,
         n_hops=1 if communicating else 2,
         half_edges=args.half_edges,
@@ -260,7 +261,8 @@ def main() -> None:
     eam.add_argument(
         "--half-edges", action="store_true",
         help="Pack each pair once instead of both directions; size "
-             "--edges-per-atom for the deduplicated count.",
+             "--edges-per-atom for the deduplicated count. With --mode comm, "
+             "boundary pairs pack on one rank and densities reverse-communicate.",
     )
 
     args = parser.parse_args()

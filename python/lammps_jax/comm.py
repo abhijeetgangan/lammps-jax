@@ -7,14 +7,14 @@ differentiation mode composes.
 """
 
 import math
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from functools import partial
 from typing import Any
 
 import jax
 import jax.extend.core
 import jax.numpy as jnp
-from jax.interpreters import ad, mlir
+from jax.interpreters import ad, batching, mlir
 
 FORWARD_TARGET = "lammps_jax.forward_comm"
 REVERSE_TARGET = "lammps_jax.reverse_comm"
@@ -95,6 +95,25 @@ def exchange_transpose(adjoint, cotangents, matrix, token):
     )
 
 
+def exchange_batch(primitive, batched_args, batch_dims):
+    # The handler forwards whole rows: the batch folds into the width.
+    matrix, token = batched_args
+    matrix_dim, token_dim = batch_dims
+    if token_dim is not None:
+        token = jax.lax.index_in_dim(token, 0, token_dim, keepdims=False)
+    if matrix_dim is None:
+        return primitive.bind(matrix, token), (None, None)
+    folded = jnp.moveaxis(matrix, matrix_dim, 2)
+    rows, width, batch = folded.shape
+    out_matrix, out_token = primitive.bind(
+        jnp.reshape(folded, (rows, width * batch)), token
+    )
+    out_matrix = jnp.moveaxis(
+        jnp.reshape(out_matrix, (rows, width, batch)), 2, matrix_dim
+    )
+    return (out_matrix, out_token), (matrix_dim, None)
+
+
 def make_exchange_primitive(name: str, target: str):
     """Define one comm custom call primitive: (matrix, token) -> (matrix, token).
 
@@ -109,6 +128,7 @@ def make_exchange_primitive(name: str, target: str):
         primitive, jax.ffi.ffi_lowering(target, operand_output_aliases={0: 0, 1: 1})
     )
     ad.primitive_jvps[primitive] = partial(exchange_jvp, primitive)
+    batching.primitive_batchers[primitive] = partial(exchange_batch, primitive)
     return primitive
 
 
@@ -147,6 +167,7 @@ class Comm:
             None if expected_widths is None else tuple(int(w) for w in expected_widths)
         )
         self.widths: list[int] = []
+        self.kinds: list[str] = []
         self.token: jax.Array | None = None
 
     def forward_comm(self, features: Any) -> Any:
@@ -155,6 +176,18 @@ class Comm:
         Linear in the features: differentiating in any mode emits the adjoint
         reverse exchange for cotangents and a forward exchange for tangents.
         """
+        return self.exchange(features, forward_exchange, "forward")
+
+    def reverse_comm(self, features: Any) -> Any:
+        """Sum ghost-row features into their owner rows and zero the ghosts.
+
+        The adjoint of forward_comm, for models that accumulate partial sums
+        on ghost rows.
+        """
+        return self.exchange(features, reverse_exchange, "reverse")
+
+    def exchange(self, features: Any, exchange_fn: Callable[..., Any],
+                 kind: str) -> Any:
         leaves, treedef, n_rows, leaf_widths = flatten_features(features)
         width = int(sum(leaf_widths))
         site = len(self.widths)
@@ -170,6 +203,7 @@ class Comm:
                     f"comm exchange {site} has width {width}, expected {expected}"
                 )
         self.widths.append(width)
+        self.kinds.append(kind)
         if not self.enabled:
             return features
 
@@ -181,7 +215,7 @@ class Comm:
         matrix = columns[0] if len(columns) == 1 else jnp.concatenate(columns, axis=1)
         if self.token is None:
             self.token = jnp.zeros((), dtype=jnp.float32)
-        matrix, self.token = forward_exchange(matrix, self.token)
+        matrix, self.token = exchange_fn(matrix, self.token)
 
         pieces = []
         offset = 0

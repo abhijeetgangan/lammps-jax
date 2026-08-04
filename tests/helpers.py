@@ -61,6 +61,10 @@ class RecordingComm:
         self.recorded.append(features)
         return features
 
+    def reverse_comm(self, features):
+        self.recorded.append(features)
+        return features
+
 
 class LookupComm:
     """Phase-B stand-in: return rows of the assembled global feature buffer.
@@ -80,6 +84,32 @@ class LookupComm:
 class NoComm:
     def forward_comm(self, features):
         return features
+
+    def reverse_comm(self, features):
+        return features
+
+
+class UniqueLookupComm:
+    """Phase-B stand-in for unique-boundary packing: reverse returns globally
+    summed values on owned rows and zeros the ghosts, forward returns owner
+    values for every row."""
+
+    def __init__(self, global_features, present, n_owned):
+        self.global_features = global_features
+        self.present = jnp.asarray(present)
+        self.n_owned = n_owned
+
+    def reverse_comm(self, features):
+        del features
+        owned = self.global_features[self.present[: self.n_owned]]
+        ghosts = jnp.zeros(
+            (len(self.present) - self.n_owned,) + owned.shape[1:], owned.dtype
+        )
+        return jnp.concatenate([owned, ghosts], axis=0)
+
+    def forward_comm(self, features):
+        del features
+        return self.global_features[self.present]
 
 
 def call_model(model_fn, model_args):
@@ -109,6 +139,75 @@ def export_and_load(path, **kwargs):
     """export_model to path, then parse and return the bundle JSON."""
     export_model(path=path, **kwargs)
     return json.loads(path.read_text())
+
+
+def unique_half_domains(positions_np, x_split, cutoff):
+    """Two slab domains with half-edge lists and every pair packed exactly once.
+
+    Local pairs keep one direction; a boundary pair goes to the rank whose
+    owned endpoint has the smaller global index.
+    """
+    domains = []
+    for present, n_owned in two_domains(positions_np, x_split, halo=cutoff):
+        senders, receivers = edges_within_cutoff(
+            positions_np[present], cutoff, senders_subset=np.arange(n_owned)
+        )
+        keep = np.where(receivers < n_owned, senders < receivers,
+                        present[senders] < present[receivers])
+        domains.append((present, n_owned, senders[keep], receivers[keep]))
+    return domains
+
+
+def assert_unique_comm_matches_reference(
+    energy_fn, reference_fn, positions_np, species_np, *, cutoff, atol,
+    x_split=3.0,
+):
+    """Unique-boundary half decomposition against the dense full-graph reference.
+
+    Phase A records the density partials each rank would reverse-exchange;
+    phase B replays with the globally summed values, so autodiff carries the
+    exact adjoint of both exchanges.
+    """
+    n_atoms = len(positions_np)
+    species = jnp.asarray(species_np, dtype=jnp.int32)
+    full_senders, full_receivers = edges_within_cutoff(positions_np, cutoff)
+
+    def reference_energy(positions):
+        node = reference_fn(positions, species, Graph(full_senders, full_receivers))
+        return jnp.sum(node)
+
+    domains = unique_half_domains(positions_np, x_split, cutoff)
+
+    def decomposed_energy(positions):
+        partials = []
+        for present, _n_owned, senders, receivers in domains:
+            recorder = RecordingComm()
+            energy_fn(
+                positions[jnp.asarray(present)], species[jnp.asarray(present)],
+                Graph(senders, receivers), recorder,
+            )
+            partials.append(recorder.recorded[0])
+        global_density = jnp.zeros((n_atoms,) + partials[0].shape[1:],
+                                   partials[0].dtype)
+        for (present, _n, _s, _r), part in zip(domains, partials):
+            global_density = global_density.at[jnp.asarray(present)].add(part)
+        total = jnp.float32(0.0)
+        for present, n_owned, senders, receivers in domains:
+            stub = UniqueLookupComm(global_density, present, n_owned)
+            node = energy_fn(
+                positions[jnp.asarray(present)], species[jnp.asarray(present)],
+                Graph(senders, receivers), stub,
+            )
+            total = total + jnp.sum(node[:n_owned])
+        return total
+
+    ref_energy, ref_grad = jax.value_and_grad(reference_energy)(
+        jnp.asarray(positions_np))
+    energy, grad = jax.value_and_grad(decomposed_energy)(jnp.asarray(positions_np))
+    assert float(energy) == pytest.approx(float(ref_energy), abs=atol)
+    force_atol = atol * (float(np.max(np.abs(np.asarray(ref_grad)))) + 1.0)
+    np.testing.assert_allclose(np.asarray(grad), np.asarray(ref_grad),
+                               atol=force_atol)
 
 
 def assert_comm_scheme_matches_reference(

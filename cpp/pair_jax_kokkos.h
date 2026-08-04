@@ -105,7 +105,8 @@ class PairJaxKokkos : public Pair, public KokkosBase {
   void pack_atoms(int nall, const x_view &x, const type_view &type);
   template <typename Scalar>
   void pack_atoms_as(int span, const x_view &x, const type_view &type);
-  void pack_edges(NeighListKokkos<device_type> *klist, bool rebuild_edges);
+  void pack_edges(NeighListKokkos<device_type> *klist, bool rebuild_edges,
+                  const x_view &x);
   void pack_box();
   template <typename Scalar>
   void pack_box_as();

@@ -87,9 +87,13 @@ Multi-rank runs pick one of two schemes at export. A ghost export widens the
 ghost shell to n_hops cutoffs and stays communication-free inside the
 program; a comm export keeps the one-cutoff shell and exchanges per-layer
 features through LAMMPS forward and reverse communication, called from inside
-the program as an FFI callback. Exchanged rows move in place on device under
-the Kokkos brick and tiled comm styles and stage through pinned host memory
-otherwise.
+the program as an FFI callback. Exchanges are linear JAX primitives whose
+transposes swap forward and reverse, so models may call either direction and
+every differentiation mode traces through them. Communicating half-edge
+exports pack each pair on one rank, matching the native half neighbor list,
+and reverse-communicate ghost density partials into their owners. Exchanged
+rows move in place on device under the Kokkos brick and tiled comm styles and
+stage through pinned host memory otherwise.
 
 cuEquivariance and OpenEquivariance kernels stay in the exported program as
 custom call targets, resolved at run time from LAMMPS_JAX_FFI_HANDLERS;

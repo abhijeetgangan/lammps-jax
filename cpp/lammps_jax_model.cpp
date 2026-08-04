@@ -228,6 +228,9 @@ ModelBundle load_bundle_file(const std::string &path)
   bundle.contract.uses_box = get_bool(json, "uses_box");
   bundle.contract.n_species = get_int_or(json, "n_species", 0);
   if (bundle.contract.n_species < 0) throw std::runtime_error("Invalid n_species in bundle");
+  bundle.contract.max_owned = get_int_or(json, "max_owned", 0);
+  if (bundle.contract.max_owned < 0 || bundle.contract.max_owned > bundle.contract.max_atoms)
+    throw std::runtime_error("Invalid max_owned in bundle");
 
   // Distinct tags make loaders that predate n_hops, comm, or half-edge packing reject the bundle.
   if (bundle.format != "lammps-jax-json" &&
@@ -236,10 +239,21 @@ ModelBundle load_bundle_file(const std::string &path)
     throw std::runtime_error("Unsupported bundle format");
   if (bundle.format == "lammps-jax-json-half-edge") {
     const std::string pairing = get_string(json, "edge_pairing");
-    if (pairing == "half")
+    if (pairing == "half") {
+      if (!bundle.contract.comm_widths.empty())
+        throw std::runtime_error(
+            "Communicating half-edge bundles now pack each boundary pair on "
+            "one rank; re-export this bundle");
       bundle.contract.half_edges = true;
-    else if (pairing != "full")
+    } else if (pairing == "half-unique") {
+      if (bundle.contract.comm_widths.empty())
+        throw std::runtime_error(
+            "Unique-boundary bundles need a communication schedule; the "
+            "partner rank's density share arrives through reverse comm");
+      bundle.contract.half_edges = true;
+    } else if (pairing != "full") {
       throw std::runtime_error("Invalid edge_pairing in bundle");
+    }
   }
   if (bundle.contract.half_edges && bundle.contract.n_hops == 1 &&
       bundle.contract.comm_widths.empty())
@@ -261,6 +275,11 @@ ModelBundle load_bundle_file(const std::string &path)
     throw std::runtime_error(
         "Communicating bundles require newton on and a one-cutoff ghost shell "
         "(n_hops = 1)");
+  if (!bundle.contract.comm_widths.empty() &&
+      bundle.contract.force_layout == ForceLayout::Edge && !bundle.contract.half_edges)
+    throw std::runtime_error(
+        "Communicating edge-force bundles require half-edge packing; full "
+        "pairing packs both directions and the newton scatter doubles forces");
   if (!bundle.contract.comm_widths.empty() && bundle.contract.precision == Precision::Float64)
     throw std::runtime_error(
         "float64 communicating bundles are not supported: the in-program feature "

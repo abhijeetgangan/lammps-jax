@@ -9,7 +9,6 @@ from typing import Any
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 
 
 def make_mace_energy(
@@ -17,12 +16,18 @@ def make_mace_energy(
     config: dict[str, Any],
     model: Any,
     communicating: bool = False,
+    owned_rows: int | None = None,
 ) -> Callable[..., Any]:
     """Build a per-atom MACE energy callable with the exported-model signature.
 
     The comm form runs `comm.forward_comm(node_feats)` before every interaction
-    after the first; the ghost form omits the `comm` argument.
+    after the first; the ghost form omits the `comm` argument. owned_rows
+    truncates the product basis to the leading owned rows, whose ghosts the
+    exchange refreshes anyway.
     """
+    if owned_rows is not None and not communicating:
+        raise ValueError("owned-row truncation needs a communicating export: "
+                         "ghost features must arrive through the exchange")
     r_max = jnp.float32(config["r_max"])
     num_elements = int(config["num_elements"])
 
@@ -55,7 +60,6 @@ def make_mace_energy(
             model._atomic_numbers,
             node_attrs_index=node_attrs_index,
         )
-
         node_energies_list = []
         node_feats_list = []
         for idx, (interaction, product) in enumerate(
@@ -74,12 +78,23 @@ def make_mace_energy(
                 n_real=None,
                 first_layer=(idx == 0),
             )
-            node_feats = product(
-                node_feats=node_feats,
-                sc=sc,
-                node_attrs=node_attrs,
-                node_attrs_index=node_attrs_index,
-            )
+            if owned_rows is not None:
+                truncated = product(
+                    node_feats=node_feats[:owned_rows],
+                    sc=None if sc is None else sc[:owned_rows],
+                    node_attrs=node_attrs[:owned_rows],
+                    node_attrs_index=node_attrs_index[:owned_rows],
+                )
+                node_feats = jnp.zeros(
+                    (n_atoms,) + truncated.shape[1:], truncated.dtype
+                ).at[:owned_rows].set(truncated)
+            else:
+                node_feats = product(
+                    node_feats=node_feats,
+                    sc=sc,
+                    node_attrs=node_attrs,
+                    node_attrs_index=node_attrs_index,
+                )
             node_feats_list.append(node_feats)
 
         for idx, readout in enumerate(model.readouts):

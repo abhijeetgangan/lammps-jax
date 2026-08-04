@@ -48,6 +48,7 @@ struct ModelContract {
   // Receptive field in cutoffs; above 1 ghosts extend to n_hops*cutoff and enter the graph.
   int n_hops = 1;
   // Half-edge bundles carry each pair once; the model scatters per-edge terms to both endpoints.
+  // Communicating half-edge bundles also pack each boundary pair on one rank only.
   bool half_edges = false;
   // Feature width of each exchange in forward order; ModelComm validates. Empty: non-communicating.
   std::vector<int> comm_widths;
@@ -57,6 +58,8 @@ struct ModelContract {
   bool uses_box = false;
   // Species the model distinguishes; more atom types abort pair_coeff. 0 means species-blind.
   int n_species = 0;
+  // Static owned-row bound for models that truncate per-node work. 0 means untruncated.
+  int max_owned = 0;
 };
 
 struct ModelBundle {

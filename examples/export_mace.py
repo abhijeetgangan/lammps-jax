@@ -388,7 +388,9 @@ def run_export(args):
         install_oeq_conv_tp()
 
     communicating = args.mode == "comm"
-    energy_fn = make_mace_energy(config=cfg, model=model, communicating=communicating)
+    energy_fn = make_mace_energy(config=cfg, model=model,
+                                 communicating=communicating,
+                                 owned_rows=args.owned_rows)
     n_types = len(args.type_z)
 
     if communicating:
@@ -407,6 +409,7 @@ def run_export(args):
         unit_style="metal",
         comm=communicating,
         n_hops=1 if communicating else int(cfg["num_interactions"]),
+        max_owned=args.owned_rows,
         custom_call_targets=targets,
         n_species=n_types,
     )
@@ -459,6 +462,9 @@ def main():
                         help="converted-model dir; default $MACE_MP_BUNDLE_DIR or "
                              "<workspace>/models/mace-mp-0-small-jax, -fused "
                              "variant for cueq and oeq")
+    exporter.add_argument("--owned-rows", type=int, default=None,
+                          help="Static owned-row bound; the product basis "
+                               "skips ghost rows. Comm mode only.")
     exporter.add_argument("--skip-check", action="store_true",
                         help="skip the adapter-vs-mace_jax parity preflight")
     converter = sub.add_parser("convert", help="torch checkpoint to a mace-jax bundle dir")

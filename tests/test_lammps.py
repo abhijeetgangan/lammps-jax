@@ -81,7 +81,13 @@ EXPORTS = {
     "mace_comm": ("export_mace.py",
                   ("export", "plain", "{output}", "--mode", "comm", "--type-z", "13",
                    "--max-atoms", "2048", "--edges-per-atom", "16",
+                   "--owned-rows", "512",
                    "--bundle-dir", str(MACE_MP_DIR), "--skip-check")),
+    "mace_owned_small": ("export_mace.py",
+                         ("export", "plain", "{output}", "--mode", "comm",
+                          "--type-z", "13", "--max-atoms", "2048",
+                          "--edges-per-atom", "16", "--owned-rows", "100",
+                          "--bundle-dir", str(MACE_MP_DIR), "--skip-check")),
     "mace_oeq": ("export_mace.py",
                  ("export", "oeq", "{output}", "--mode", "comm", "--type-z", "13",
                   "--max-atoms", "2048", "--edges-per-atom", "16",
@@ -99,6 +105,11 @@ EXPORTS = {
                   ("eam", "{output}", "--setfl", "examples/potentials/CuZr.eam.alloy.gz",
                    "--max-atoms", "8192", "--edges-per-atom", "64",
                    "--half-edges", "--precision", "float64")),
+    "cuzr_uniq": ("export_model.py",
+                  ("eam", "{output}", "--setfl",
+                   "examples/potentials/CuZr.eam.alloy.gz",
+                   "--max-atoms", "3072", "--edges-per-atom", "32",
+                   "--half-edges", "--mode", "comm")),
 }
 
 DECKS = {
@@ -333,6 +344,10 @@ CASES = {
     "cuzr_edge_static": dict(
         kind="static", deck="cuzr_static", bundle="cuzr_edge", newton="on",
         pressure=True, dense="cuzr", pressure_tol=5.0e-3),
+    # Rank pairs assign boundary pairs differently; measured f32 gap 3.5e-3 bar.
+    "cuzr_uniq_static": dict(
+        kind="static", deck="cuzr_static", bundle="cuzr_uniq", newton="on",
+        pressure=True, dense="cuzr", pressure_tol=1.0e-2),
     "eam_nve": dict(kind="nve", deck="eam_nve", bundle="eam", dense="eam"),
     "mace_comm_nve": dict(kind="nve", deck="mace_nve", bundle="mace_comm",
                           pressure_tol=5.0e-2),
@@ -351,6 +366,9 @@ NEGATIVE_CONTROLS = {
     "cuzr_species": dict(bundle="cuzr", newton="on", variables={},
                          deck="cuzr_types3_static",
                          message="distinguishes 2 species"),
+    "mace_owned_exceeded": dict(bundle="mace_owned_small", newton="on",
+                                variables={}, deck="mace_nve",
+                                message="owned-row capacity exceeded"),
 }
 
 FORCE_COLUMNS = ("fx", "fy", "fz")

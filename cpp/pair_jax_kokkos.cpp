@@ -68,6 +68,9 @@ struct PackNeighborFunctor {
   int num_rows;
   bool duplicate_reverse_edges;
   bool half_edges;
+  bool unique_boundary;
+  int nlocal;
+  typename ArrayTypes<DeviceType>::t_kkfloat_1d_3_lr_randomread x;
 
   // copymode makes each per-launch functor copy's ~NeighListKokkos skip freeing shared storage.
   ~PackNeighborFunctor() { list.copymode = 1; }
@@ -84,6 +87,14 @@ struct PackNeighborFunctor {
     if (j >= max_atoms) return;
     // Half-edge bundles keep one direction per pair; symmetrized models would double count.
     if (half_edges && j < i) return;
+    // Native half-list rule: the ghost's shifted coordinates pick one rank per pair.
+    if (unique_boundary && j >= nlocal) {
+      if (x(j, 2) < x(i, 2)) return;
+      if (x(j, 2) == x(i, 2)) {
+        if (x(j, 1) < x(i, 1)) return;
+        if (x(j, 1) == x(i, 1) && x(j, 0) < x(i, 0)) return;
+      }
+    }
 
     const int edges_to_add = duplicate_reverse_edges ? 2 : 1;
     const int edge = Kokkos::atomic_fetch_add(&edge_count(), edges_to_add);
@@ -132,9 +143,6 @@ struct AddEdgeForcesFunctor {
   Kokkos::View<int *, DeviceType> senders;
   Kokkos::View<int *, DeviceType> receivers;
   bool newton_pair;
-  // Half-edge packing keeps boundary pairs on both ranks; each copy adds half.
-  bool halve_ghost_pairs;
-  int nlocal;
   double scale;
 
   KOKKOS_INLINE_FUNCTION
@@ -143,11 +151,9 @@ struct AddEdgeForcesFunctor {
     // Senders are owned atoms: edges come from local-list rows 0..inum-1 in both newton modes.
     const int i = senders(edge);
     const int j = receivers(edge);
-    const double weight =
-        (newton_pair && halve_ghost_pairs && j >= nlocal) ? 0.5 * scale : scale;
-    const KK_ACC_FLOAT fx = static_cast<KK_ACC_FLOAT>(weight * edge_forces(edge, 0));
-    const KK_ACC_FLOAT fy = static_cast<KK_ACC_FLOAT>(weight * edge_forces(edge, 1));
-    const KK_ACC_FLOAT fz = static_cast<KK_ACC_FLOAT>(weight * edge_forces(edge, 2));
+    const KK_ACC_FLOAT fx = static_cast<KK_ACC_FLOAT>(scale * edge_forces(edge, 0));
+    const KK_ACC_FLOAT fy = static_cast<KK_ACC_FLOAT>(scale * edge_forces(edge, 1));
+    const KK_ACC_FLOAT fz = static_cast<KK_ACC_FLOAT>(scale * edge_forces(edge, 2));
     Kokkos::atomic_add(&f(i, 0), fx);
     Kokkos::atomic_add(&f(i, 1), fy);
     Kokkos::atomic_add(&f(i, 2), fz);
@@ -179,7 +185,8 @@ struct VirialFDotRFunctor {
   }
 };
 
-// Model comm rows are f32; two features bit-pack per double slot, matching the host callbacks.
+// Model comm rows are f32; two features bit-pack per double slot, matching the
+// host callbacks. One thread per element: wide exchanges stay coalesced.
 struct PackCommRowsByList {
   typename ArrayTypes<LMPDeviceType>::t_int_1d sendlist;
   typename ArrayTypes<LMPDeviceType>::t_double_1d buf;
@@ -188,12 +195,14 @@ struct PackCommRowsByList {
   int slots;
 
   KOKKOS_INLINE_FUNCTION
-  void operator()(const int i) const
+  void operator()(const int64_t flat) const
   {
+    const int i = static_cast<int>(flat / width);
+    const int w = static_cast<int>(flat % width);
     const float *row = rows + static_cast<size_t>(sendlist(i)) * width;
     float *packed = reinterpret_cast<float *>(&buf(static_cast<size_t>(i) * slots));
-    for (int w = 0; w < width; ++w) packed[w] = row[w];
-    if (width & 1) packed[width] = 0.0f;
+    packed[w] = row[w];
+    if ((width & 1) && w + 1 == width) packed[width] = 0.0f;
   }
 };
 
@@ -205,11 +214,12 @@ struct UnpackCommRowsAt {
   int first;
 
   KOKKOS_INLINE_FUNCTION
-  void operator()(const int i) const
+  void operator()(const int64_t flat) const
   {
-    float *row = rows + static_cast<size_t>(first + i) * width;
-    const float *packed = reinterpret_cast<const float *>(&buf(static_cast<size_t>(i) * slots));
-    for (int w = 0; w < width; ++w) row[w] = packed[w];
+    const int i = static_cast<int>(flat / width);
+    const int w = static_cast<int>(flat % width);
+    rows[static_cast<size_t>(first + i) * width + w] =
+        reinterpret_cast<const float *>(&buf(static_cast<size_t>(i) * slots))[w];
   }
 };
 
@@ -221,12 +231,13 @@ struct PackCommRowsAt {
   int first;
 
   KOKKOS_INLINE_FUNCTION
-  void operator()(const int i) const
+  void operator()(const int64_t flat) const
   {
-    const float *row = rows + static_cast<size_t>(first + i) * width;
+    const int i = static_cast<int>(flat / width);
+    const int w = static_cast<int>(flat % width);
     float *packed = reinterpret_cast<float *>(&buf(static_cast<size_t>(i) * slots));
-    for (int w = 0; w < width; ++w) packed[w] = row[w];
-    if (width & 1) packed[width] = 0.0f;
+    packed[w] = rows[static_cast<size_t>(first + i) * width + w];
+    if ((width & 1) && w + 1 == width) packed[width] = 0.0f;
   }
 };
 
@@ -239,11 +250,12 @@ struct AddCommRowsByList {
   int slots;
 
   KOKKOS_INLINE_FUNCTION
-  void operator()(const int i) const
+  void operator()(const int64_t flat) const
   {
-    float *row = rows + static_cast<size_t>(sendlist(i)) * width;
-    const float *packed = reinterpret_cast<const float *>(&buf(static_cast<size_t>(i) * slots));
-    for (int w = 0; w < width; ++w) row[w] += packed[w];
+    const int i = static_cast<int>(flat / width);
+    const int w = static_cast<int>(flat % width);
+    rows[static_cast<size_t>(sendlist(i)) * width + w] +=
+        reinterpret_cast<const float *>(&buf(static_cast<size_t>(i) * slots))[w];
   }
 };
 
@@ -418,7 +430,8 @@ int PairJaxKokkos::pack_forward_comm_kokkos(int n, DAT::tdual_int_1d k_sendlist,
 {
   const int slots = comm_double_slots(comm_width);
   Kokkos::parallel_for(
-      "LAMMPSJAX::pack_forward_comm", Kokkos::RangePolicy<LMPDeviceType>(0, n),
+      "LAMMPSJAX::pack_forward_comm",
+      Kokkos::RangePolicy<LMPDeviceType>(0, static_cast<int64_t>(n) * comm_width),
       PackCommRowsByList{k_sendlist.view<LMPDeviceType>(), k_buf.view<LMPDeviceType>(),
                          d_comm_rows, comm_width, slots});
   return n * slots;
@@ -428,7 +441,8 @@ void PairJaxKokkos::unpack_forward_comm_kokkos(int n, int first, DAT::tdual_doub
 {
   const int slots = comm_double_slots(comm_width);
   Kokkos::parallel_for(
-      "LAMMPSJAX::unpack_forward_comm", Kokkos::RangePolicy<LMPDeviceType>(0, n),
+      "LAMMPSJAX::unpack_forward_comm",
+      Kokkos::RangePolicy<LMPDeviceType>(0, static_cast<int64_t>(n) * comm_width),
       UnpackCommRowsAt{k_buf.view<LMPDeviceType>(), d_comm_rows, comm_width, slots, first});
 }
 
@@ -436,7 +450,8 @@ int PairJaxKokkos::pack_reverse_comm_kokkos(int n, int first, DAT::tdual_double_
 {
   const int slots = comm_double_slots(comm_width);
   Kokkos::parallel_for(
-      "LAMMPSJAX::pack_reverse_comm", Kokkos::RangePolicy<LMPDeviceType>(0, n),
+      "LAMMPSJAX::pack_reverse_comm",
+      Kokkos::RangePolicy<LMPDeviceType>(0, static_cast<int64_t>(n) * comm_width),
       PackCommRowsAt{k_buf.view<LMPDeviceType>(), d_comm_rows, comm_width, slots, first});
   return n * slots;
 }
@@ -446,7 +461,8 @@ void PairJaxKokkos::unpack_reverse_comm_kokkos(int n, DAT::tdual_int_1d k_sendli
 {
   const int slots = comm_double_slots(comm_width);
   Kokkos::parallel_for(
-      "LAMMPSJAX::unpack_reverse_comm", Kokkos::RangePolicy<LMPDeviceType>(0, n),
+      "LAMMPSJAX::unpack_reverse_comm",
+      Kokkos::RangePolicy<LMPDeviceType>(0, static_cast<int64_t>(n) * comm_width),
       AddCommRowsByList{k_sendlist.view<LMPDeviceType>(), k_buf.view<LMPDeviceType>(),
                         d_comm_rows, comm_width, slots});
 }
@@ -677,7 +693,7 @@ void PairJaxKokkos::pack_atoms_as(int span, const PairJaxKokkos::x_view &x,
 }
 
 void PairJaxKokkos::pack_edges(NeighListKokkos<PairJaxKokkos::device_type> *klist,
-                               bool rebuild_edges)
+                               bool rebuild_edges, const PairJaxKokkos::x_view &x)
 {
   if (rebuild_edges) {
     Kokkos::deep_copy(exec, d_edge_count, 0);
@@ -709,7 +725,9 @@ void PairJaxKokkos::pack_edges(NeighListKokkos<PairJaxKokkos::device_type> *klis
                                            bundle.contract.max_atoms, bundle.contract.max_edges,
                                            max_neighbors_per_atom, num_rows,
                                            duplicate_reverse_edges,
-                                           bundle.contract.half_edges});
+                                           bundle.contract.half_edges,
+                                           bundle.contract.half_edges && comm_enabled(),
+                                           atom->nlocal, x});
   }
 }
 
@@ -797,7 +815,7 @@ void PairJaxKokkos::add_model_forces_as(CUdeviceptr force_output, const PairJaxK
         Kokkos::RangePolicy<LMPDeviceType>(exec, 0, cached_edge_count),
         AddEdgeForcesFunctor<LMPDeviceType, Scalar>{f, edge_forces, d_senders, d_receivers,
                                                     static_cast<bool>(force->newton_pair),
-                                                    bundle.contract.half_edges, nlocal, scale});
+                                                    scale});
   } else {
     ForceView model_forces(reinterpret_cast<const Scalar *>(force_output), bundle.contract.max_atoms);
     const int limit = force->newton_pair ? nall : nlocal;
@@ -852,7 +870,7 @@ void PairJaxKokkos::compute(int eflag, int vflag)
   CUstream stream = reinterpret_cast<CUstream>(exec.cuda_stream());
 
   pack_atoms(nall, x, type);
-  pack_edges(klist, rebuild_edges);
+  pack_edges(klist, rebuild_edges, x);
   if (bundle.contract.uses_box) pack_box();
 
   Kokkos::deep_copy(exec, d_nlocal, nlocal);
@@ -863,12 +881,15 @@ void PairJaxKokkos::compute(int eflag, int vflag)
     int edge_count = 0;
     Kokkos::deep_copy(edge_overflow, d_edge_overflow);
     Kokkos::deep_copy(edge_count, d_edge_count);
-    const int local_counts[3] = {nall, edge_count, edge_overflow};
-    int global_counts[3] = {nall, edge_count, edge_overflow};
-    MPI_Allreduce(local_counts, global_counts, 3, MPI_INT, MPI_MAX, world);
+    const int local_counts[4] = {nall, edge_count, edge_overflow, nlocal};
+    int global_counts[4] = {nall, edge_count, edge_overflow, nlocal};
+    MPI_Allreduce(local_counts, global_counts, 4, MPI_INT, MPI_MAX, world);
     if (global_counts[0] > bundle.contract.max_atoms)
       error->all(FLERR, "LAMMPS-JAX atom capacity exceeded: global max {} atoms, capacity {}",
                  global_counts[0], bundle.contract.max_atoms);
+    if (bundle.contract.max_owned > 0 && global_counts[3] > bundle.contract.max_owned)
+      error->all(FLERR, "LAMMPS-JAX owned-row capacity exceeded: global max {} owned atoms, "
+                 "capacity {}", global_counts[3], bundle.contract.max_owned);
     if (global_counts[2])
       error->all(FLERR, "LAMMPS-JAX edge capacity exceeded: global max {} edges, capacity {}",
                  global_counts[1], bundle.contract.max_edges);

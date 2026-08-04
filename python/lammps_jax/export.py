@@ -6,6 +6,7 @@ where-substitute masked indices and guard divisions or the gradient goes NaN.
 
 import base64
 import json
+import re
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -205,6 +206,7 @@ def export_model(
     half_edges: bool = False,
     custom_call_targets: tuple[str, ...] = (),
     n_species: int | None = None,
+    max_owned: int | None = None,
 ) -> dict[str, Any]:
     """Export a JAX model to a fixed-capacity sparse LAMMPS-JAX JSON bundle.
 
@@ -250,6 +252,12 @@ def export_model(
                 "per-edge forces; a direct atom force_fn has no ghost-row "
                 "convention"
             )
+        if force_output == EDGE_FORCE and not half_edges:
+            raise ValueError(
+                "communicating edge-force exports need half_edges=True; full "
+                "pairing packs both directions of every pair and the newton "
+                "scatter would double every force"
+            )
         if n_hops != 1:
             raise ValueError(
                 "communicating exports use a one-cutoff ghost shell; n_hops must be 1"
@@ -258,6 +266,19 @@ def export_model(
         raise ValueError(
             "half_edges requires n_hops > 1 or a communicating export; the "
             "single-hop packer does not deduplicate edge directions"
+        )
+    if max_owned is not None and not (comm and 0 < max_owned <= max_atoms):
+        raise ValueError(
+            "max_owned needs a communicating export and 0 < max_owned <= "
+            "max_atoms; ghost rows only refresh through the exchange"
+        )
+    # Communicating half-edge exports pack each boundary pair on one rank.
+    unique_boundary = comm and half_edges
+    if unique_boundary and newton != "on":
+        raise ValueError(
+            "communicating half-edge exports need newton='on': boundary pairs "
+            "pack on one rank and ghost force rows return through the LAMMPS "
+            "reverse communication"
         )
     if force_output == EDGE_FORCE and force_fn is None:
         raise ValueError("edge-force output requires a direct force_fn")
@@ -312,12 +333,35 @@ def export_model(
     # Staging is sized from this width trace; per-callable schedules concatenate.
     comm_widths: tuple[int, ...] = ()
     if comm:
+        schedules = []
         for fn in (energy_fn, force_fn):
             if fn is None:
                 continue
             recorder = Comm(enabled=False)
             jax.eval_shape(lambda *a, fn=fn: call_model_with(fn, a, recorder)[0], *args)  # ty: ignore[invalid-argument-type]
+            schedules.append((tuple(recorder.widths), tuple(recorder.kinds)))
             comm_widths += tuple(recorder.widths)
+        comm_kinds = tuple(k for _w, kinds in schedules for k in kinds)
+        if sum(1 for w, _k in schedules if w) > 1 and len(set(comm_widths)) > 1:
+            # The fused program interleaves one token chain per callable.
+            raise ValueError(
+                "comm exports with separate energy and force callables need a "
+                f"single exchange width; got schedules "
+                f"{[list(w) for w, _k in schedules]}"
+            )
+        if "reverse" in comm_kinds and len(set(comm_widths)) > 1:
+            # Reverse sites validate mirrored from the schedule end.
+            raise ValueError(
+                "comm schedules with reverse exchanges need a single exchange "
+                f"width; got {list(comm_widths)}"
+            )
+        if unique_boundary and any(not w or k[0] != "reverse"
+                                   for w, k in schedules):
+            raise ValueError(
+                "communicating half-edge models must reverse-communicate ghost "
+                "density partials before any other exchange; the packer keeps "
+                "each boundary pair on one rank only"
+            )
         if not comm_widths:
             raise ValueError(
                 "comm=True but the model never called comm.forward_comm; export "
@@ -367,6 +411,25 @@ def export_model(
         for target in (CUSTOM_CALL_TARGETS if comm else ()) + tuple(custom_call_targets)
     )
 
+    exchange_width = re.compile(
+        r"custom_call @lammps_jax\.(?:forward|reverse)_comm\(.*?"
+        r"tensor<\d+x(\d+)xf32>"
+    )
+
+    def check_exchange_widths(exported: Any) -> None:
+        if not comm_widths:
+            return
+        allowed = set(comm_widths)
+        for line in exported.mlir_module().splitlines():
+            match = exchange_width.search(line)
+            if match and int(match.group(1)) not in allowed:
+                raise ValueError(
+                    f"lowered exchange width {match.group(1)} is not in the "
+                    f"recorded schedule {sorted(allowed)}; exchanges under "
+                    "jax.vmap fold the batch into the width and cannot honor "
+                    "the bundle schedule"
+                )
+
     # Portable VHLO bytecode; PJRT's mlir format auto-detects it.
     def export_mlir(fn: Callable[..., Any] | None) -> str:
         if fn is None:
@@ -376,6 +439,7 @@ def export_model(
             exported = jax.export.export(fn, platforms=("cuda",), disabled_checks=disabled_checks)(  # ty: ignore[invalid-argument-type]
                 *args
             )
+        check_exchange_widths(exported)
         return base64.b64encode(exported.mlir_module_serialized).decode("ascii")
 
     from jaxlib import xla_client
@@ -410,7 +474,8 @@ def export_model(
             "force_output": force_output,
             "newton": newton,
             "n_hops": n_hops,
-            "edge_pairing": "half" if half_edges else "full",
+            "edge_pairing": ("half-unique" if unique_boundary
+                             else "half" if half_edges else "full"),
             "comm_widths": list(comm_widths),
             # "__gpu$" handlers ship in the plugin; recording them would demand a mapping.
             "custom_call_targets": sorted(
@@ -422,5 +487,7 @@ def export_model(
     }
     if n_species is not None:
         bundle["contract"]["n_species"] = n_species
+    if max_owned is not None:
+        bundle["contract"]["max_owned"] = max_owned
     Path(path).write_text(json.dumps(bundle, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return bundle

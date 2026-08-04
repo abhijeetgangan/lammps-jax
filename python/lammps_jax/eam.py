@@ -33,7 +33,10 @@ def make_eam_energy(
 
     Nonzero `pair_embedding` reads neighbor densities; plain single-hop exports
     of that form are wrong under decomposition with no error raised.
+    Communicating half-edge models pack each pair on one rank only and
+    reverse-communicate ghost density partials into their owners.
     """
+    unique_boundary = communicating and half_edges
 
     def node_energies(positions, species, graph, comm=None):
         del species
@@ -52,10 +55,15 @@ def make_eam_energy(
         # Sender-side scatter: exact wherever neighbor rows are complete.
         pair_term = 0.5 * jnp.asarray(pair_a, dtype) * envelope
         density_term = jnp.asarray(dens_f0, dtype) * envelope
-        pair_energy = zeros.at[safe_senders].add(pair_term)
+        if unique_boundary:
+            # One rank packs each pair; the owned sender carries the full phi.
+            pair_energy = zeros.at[safe_senders].add(2.0 * pair_term)
+        else:
+            pair_energy = zeros.at[safe_senders].add(pair_term)
+            if half_edges:
+                pair_energy = pair_energy.at[safe_receivers].add(pair_term)
         density = zeros.at[safe_senders].add(density_term)
         if half_edges:
-            pair_energy = pair_energy.at[safe_receivers].add(pair_term)
             density = density.at[safe_receivers].add(density_term)
 
         eps = jnp.asarray(embed_eps, dtype)
@@ -65,16 +73,28 @@ def make_eam_energy(
             return -jnp.asarray(embed_c, dtype) * (jnp.sqrt(rho + eps) - jnp.sqrt(eps))
 
         if comm is not None:
-            density = comm.forward_comm(density)
+            if unique_boundary:
+                density = comm.reverse_comm(density)
+                if pair_embedding != 0.0:
+                    # The cross term reads neighbor densities on ghost rows.
+                    density = comm.forward_comm(density)
+            else:
+                density = comm.forward_comm(density)
 
         energy = pair_energy + embed(density)
         if pair_embedding != 0.0:
             kappa = jnp.asarray(pair_embedding, dtype)
-            cross = kappa * envelope * embed(density)[safe_receivers]
-            energy = energy + zeros.at[safe_senders].add(cross)
-            if half_edges:
-                reverse = kappa * envelope * embed(density)[safe_senders]
-                energy = energy + zeros.at[safe_receivers].add(reverse)
+            if unique_boundary:
+                cross = kappa * envelope * (
+                    embed(density)[safe_receivers] + embed(density)[safe_senders]
+                )
+                energy = energy + zeros.at[safe_senders].add(cross)
+            else:
+                cross = kappa * envelope * embed(density)[safe_receivers]
+                energy = energy + zeros.at[safe_senders].add(cross)
+                if half_edges:
+                    reverse = kappa * envelope * embed(density)[safe_senders]
+                    energy = energy + zeros.at[safe_receivers].add(reverse)
         return energy
 
     if communicating:
@@ -240,6 +260,7 @@ def make_setfl_energy(tables: dict, *, communicating: bool = False,
     LAMMPS type t must carry element t-1 of the file; distribution follows
     make_eam_energy.
     """
+    unique_boundary = communicating and half_edges
     cutoff = tables["cutoff"]
 
     def node_energies(positions, species, graph, comm=None):
@@ -269,15 +290,21 @@ def make_setfl_energy(tables: dict, *, communicating: bool = False,
         z2 = spline_lookup(pair_tables, pair_index[sender_species, receiver_species],
                            r, tables["dr"])
         pair_term = jnp.where(valid, 0.5 * z2 / r, zero)
-        pair_energy = zeros.at[safe_senders].add(pair_term)
+        if unique_boundary:
+            # One rank packs each pair; the owned sender carries the full phi.
+            pair_energy = zeros.at[safe_senders].add(2.0 * pair_term)
+        else:
+            pair_energy = zeros.at[safe_senders].add(pair_term)
+            if half_edges:
+                pair_energy = pair_energy.at[safe_receivers].add(pair_term)
         if half_edges:
             # The reverse direction reads the other endpoint's element.
             rho_reverse = spline_lookup(density_tables, sender_species, r, tables["dr"])
             density = density.at[safe_receivers].add(jnp.where(valid, rho_reverse, zero))
-            pair_energy = pair_energy.at[safe_receivers].add(pair_term)
 
         if comm is not None:
-            density = comm.forward_comm(density)
+            density = (comm.reverse_comm(density) if unique_boundary
+                       else comm.forward_comm(density))
 
         embed = spline_lookup(embedding, species, density, tables["drho"],
                               extrapolate=True)
@@ -304,6 +331,7 @@ def make_setfl_edge_force(tables: dict, *, communicating: bool = False,
     receiver, matching PairEAM::compute. Communicating exports exchange the
     completed density so ghost rows embed with their owner's value.
     """
+    unique_boundary = communicating and half_edges
     cutoff = tables["cutoff"]
 
     def edge_forces(positions, species, graph, comm=None):
@@ -333,7 +361,12 @@ def make_setfl_edge_force(tables: dict, *, communicating: bool = False,
             rho_reverse = spline_lookup(density_tables, sender_species, r, tables["dr"])
             density = density.at[safe_receivers].add(jnp.where(valid, rho_reverse, zero))
         if comm is not None:
-            density = comm.forward_comm(density)
+            if unique_boundary:
+                # Owners complete on reverse; ghost fp needs the forward.
+                density = comm.reverse_comm(density)
+                density = comm.forward_comm(density)
+            else:
+                density = comm.forward_comm(density)
 
         fp = spline_lookup(embedding, species, density, tables["drho"],
                            extrapolate=True, derivative=True)

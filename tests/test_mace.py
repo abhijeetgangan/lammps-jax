@@ -7,6 +7,7 @@ import os
 import sys
 from pathlib import Path
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -25,7 +26,14 @@ import export_mace  # installs the torch-free Wigner-3j cache shims
 from flax import nnx
 from mace_jax.tools.bundle import load_model_bundle
 
-from helpers import Graph, assert_comm_scheme_matches_reference, edges_within_cutoff
+from helpers import (
+    Graph,
+    LookupComm,
+    RecordingComm,
+    assert_comm_scheme_matches_reference,
+    edges_within_cutoff,
+    two_domains,
+)
 from lammps_jax.mace import make_mace_energy
 
 
@@ -91,6 +99,56 @@ def test_mace_comm_scheme_matches_reference(mp_setup, exchange, should_match):
         scale_force_atol=True,
         x_split=12.15,
     )
+
+
+def test_mace_owned_rows_match_untruncated(mp_setup):
+    """Truncating the product basis to owned rows must not move the physics:
+    the exchange refreshes ghost features either way."""
+    config, model, positions_np, species_np = mp_setup
+    cutoff = float(config["r_max"])
+    species = jnp.asarray(species_np, jnp.int32)
+    domains = []
+    for present, n_owned in two_domains(positions_np, 12.15, halo=cutoff):
+        senders, receivers = edges_within_cutoff(
+            positions_np[present], cutoff, senders_subset=np.arange(n_owned))
+        domains.append((present, n_owned, senders, receivers))
+    assert max(n for _p, n, _s, _r in domains) <= 64 < max(
+        len(p) for p, _n, _s, _r in domains)
+
+    def decomposed(fn):
+        def energy(positions):
+            recorded = []
+            for present, _n_owned, senders, receivers in domains:
+                recorder = RecordingComm()
+                fn(positions[jnp.asarray(present)], species[jnp.asarray(present)],
+                   Graph(senders, receivers), recorder)
+                recorded.append(recorder.recorded[0])
+            global_feats = jnp.zeros(
+                (len(positions_np),) + recorded[0].shape[1:], recorded[0].dtype)
+            for (present, n_owned, _s, _r), feats in zip(domains, recorded):
+                global_feats = global_feats.at[
+                    jnp.asarray(present[:n_owned])].set(feats[:n_owned])
+            total = jnp.float32(0.0)
+            for present, n_owned, senders, receivers in domains:
+                node = fn(positions[jnp.asarray(present)],
+                          species[jnp.asarray(present)],
+                          Graph(senders, receivers),
+                          LookupComm(global_feats, present))
+                total = total + jnp.sum(node[:n_owned])
+            return total
+        return energy
+
+    with pytest.raises(ValueError, match="owned-row truncation"):
+        make_mace_energy(config=config, model=model, owned_rows=64)
+    full_fn = make_mace_energy(config=config, model=model, communicating=True)
+    owned_fn = make_mace_energy(config=config, model=model, communicating=True,
+                                owned_rows=64)
+    e_full, g_full = jax.value_and_grad(decomposed(full_fn))(
+        jnp.asarray(positions_np))
+    e_own, g_own = jax.value_and_grad(decomposed(owned_fn))(
+        jnp.asarray(positions_np))
+    assert float(e_own) == pytest.approx(float(e_full), abs=1e-4)
+    np.testing.assert_allclose(np.asarray(g_own), np.asarray(g_full), atol=1e-4)
 
 
 def test_mace_mp_adapter_matches_torch_reference():
