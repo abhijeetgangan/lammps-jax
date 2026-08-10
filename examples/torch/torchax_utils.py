@@ -1,4 +1,4 @@
-"""torchax interop shared by the torch-import scripts; importing also
+"""torchax interop shared by the torch export scripts; importing also
 sets the jax flags that embed baked weights as export constants."""
 
 import copy

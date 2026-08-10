@@ -101,9 +101,8 @@ cuEquivariance and OpenEquivariance kernels stay in the exported program as
 custom call targets, resolved at run time from LAMMPS_JAX_FFI_HANDLERS;
 contrib/ffi-replay handles libraries whose compiled kernels only exist inside
 the exporting process. NequIP checkpoints export through the uv-runnable
-scripts in examples/torch-import, which trace the torch blocks via torchax
-into the serialized program and reuse the same kernels and exchange
-machinery.
+scripts in examples/torch, which trace the torch blocks via torchax into
+the serialized program; the bundles load and run like any native export.
 
 ## Citation
 

@@ -38,7 +38,7 @@ jobs:
       - run: >
           uv pip install --torch-backend=cpu -e . torch==2.8.0
           torchax==0.0.13 nequip==0.19.0 jax==0.10.1
-      - run: .venv/bin/python examples/torch-import/nequip_export.py
+      - run: .venv/bin/python examples/torch/nequip_export.py
 
   mace:
     runs-on: ubuntu-latest
