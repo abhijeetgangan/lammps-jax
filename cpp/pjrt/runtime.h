@@ -105,9 +105,6 @@ class Runtime {
   ExecutablePtr energy_executable_{nullptr, ExecutableDeleter{}};
   ExecutablePtr energy_force_executable_{nullptr, ExecutableDeleter{}};
   OutputLifetime output_lifetime_;
-  // Input views persist while the engine buffers keep their pointers and shapes.
-  std::vector<DeviceBufferSpec> cached_input_specs_;
-  std::vector<BufferPtr> cached_input_views_;
   std::unique_ptr<ModelComm> model_comm_;
 };
 

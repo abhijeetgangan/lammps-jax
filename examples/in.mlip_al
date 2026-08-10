@@ -1,6 +1,6 @@
 # .venv/bin/python examples/export_mace.py export plain mace-mp.lammps-jax.json --type-z 13
 # lmp -k on g 1 -sf kk -pk kokkos newton on neigh half \
-#   -var pjrt /absolute/path/xla_cuda_plugin.so -in examples/in.mace_mp_al
+#   -var pjrt /absolute/path/xla_cuda_plugin.so -in examples/in.mlip_al
 # steps=0 dumps frame-0 forces; steps>0 runs NVE at 300 K without a dump.
 
 variable bundle index mace-mp.lammps-jax.json

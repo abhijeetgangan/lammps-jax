@@ -75,7 +75,9 @@ Models are exported with `jax.export` into a JSON bundle holding the
 serialized program and the settings the pair style enforces at load: atom and
 edge capacities, cutoff, precision, unit style, and the distribution scheme.
 Exported programs have static shapes, so positions and the edge list are
-padded to capacity and an edge mask marks the live entries.
+padded to capacity and an edge mask marks the live entries. The pair style
+distance-filters pairs to the model cutoff and repacks the edge list every
+step, so edge capacity sizes to the cutoff rather than cutoff plus skin.
 
 The pair style executes the bundle through the PJRT C API, loading the same
 plugin library jax uses on the GPU, so the build never needs XLA. Kokkos kernels
@@ -98,7 +100,10 @@ stage through pinned host memory otherwise.
 cuEquivariance and OpenEquivariance kernels stay in the exported program as
 custom call targets, resolved at run time from LAMMPS_JAX_FFI_HANDLERS;
 contrib/ffi-replay handles libraries whose compiled kernels only exist inside
-the exporting process.
+the exporting process. NequIP checkpoints export through the uv-runnable
+scripts in examples/torch-import, which trace the torch blocks via torchax
+into the serialized program and reuse the same kernels and exchange
+machinery.
 
 ## Citation
 

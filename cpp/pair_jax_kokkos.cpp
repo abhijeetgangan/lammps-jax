@@ -70,6 +70,7 @@ struct PackNeighborFunctor {
   bool half_edges;
   bool unique_boundary;
   int nlocal;
+  double cutsq;
   typename ArrayTypes<DeviceType>::t_kkfloat_1d_3_lr_randomread x;
 
   // copymode makes each per-launch functor copy's ~NeighListKokkos skip freeing shared storage.
@@ -85,6 +86,11 @@ struct PackNeighborFunctor {
     if (i >= max_atoms || jj >= list.d_numneigh(i)) return;
     const int j = list.d_neighbors(i, jj) & NEIGHMASK;
     if (j >= max_atoms) return;
+    // Skin pairs carry zero model weight; packing only true-cutoff pairs shrinks edge capacity.
+    const double dx = x(i, 0) - x(j, 0);
+    const double dy = x(i, 1) - x(j, 1);
+    const double dz = x(i, 2) - x(j, 2);
+    if (dx * dx + dy * dy + dz * dz > cutsq) return;
     // Half-edge bundles keep one direction per pair; symmetrized models would double count.
     if (half_edges && j < i) return;
     // Native half-list rule: the ghost's shifted coordinates pick one rank per pair.
@@ -283,6 +289,9 @@ PairJaxKokkos::PairJaxKokkos(LAMMPS *lmp) : Pair(lmp)
 
 PairJaxKokkos::~PairJaxKokkos()
 {
+#ifdef KOKKOS_ENABLE_CUDA
+  if (input_ready_event != nullptr) cuEventDestroy(input_ready_event);
+#endif
   if (allocated) {
     memory->destroy(setflag);
     memory->destroy(cutsq);
@@ -311,9 +320,15 @@ void PairJaxKokkos::allocate_device_buffers()
   d_nghost = scalar_int_view("lammps_jax_nghost");
   d_edge_count = scalar_int_view("lammps_jax_edge_count");
   d_edge_overflow = scalar_int_view("lammps_jax_edge_overflow");
+  h_edge_count = scalar_int_pinned_view("lammps_jax_edge_count_host");
+  h_edge_overflow = scalar_int_pinned_view("lammps_jax_edge_overflow_host");
   d_senders = int_view("lammps_jax_senders", max_edges);
   d_receivers = int_view("lammps_jax_receivers", max_edges);
   d_edge_mask = bool_view("lammps_jax_edge_mask", max_edges);
+  // Rank-local failure: the throw reaches coeff()'s catch, which error->one's.
+  if (input_ready_event == nullptr &&
+      cuEventCreate(&input_ready_event, CU_EVENT_DISABLE_TIMING) != CUDA_SUCCESS)
+    throw std::runtime_error("Failed to create CUDA event for LAMMPS-JAX inputs");
 #endif
 }
 
@@ -727,7 +742,8 @@ void PairJaxKokkos::pack_edges(NeighListKokkos<PairJaxKokkos::device_type> *klis
                                            duplicate_reverse_edges,
                                            bundle.contract.half_edges,
                                            bundle.contract.half_edges && comm_enabled(),
-                                           atom->nlocal, x});
+                                           atom->nlocal,
+                                           bundle.contract.cutoff * bundle.contract.cutoff, x});
   }
 }
 
@@ -858,7 +874,8 @@ void PairJaxKokkos::compute(int eflag, int vflag)
 
   auto *klist = dynamic_cast<NeighListKokkos<LMPDeviceType> *>(list);
   if (klist == nullptr) error->all(FLERR, "LAMMPS-JAX requires a Kokkos device neighbor list");
-  const bool rebuild_edges = !edge_cache_valid || (neighbor->ago == 0);
+  // Edges are cutoff-filtered against current positions, so repack every step.
+  const bool rebuild_edges = true;
 
   atomKK->sync(execution_space, datamask_read);
   atomKK->modified(execution_space, datamask_modify);
@@ -876,61 +893,70 @@ void PairJaxKokkos::compute(int eflag, int vflag)
   Kokkos::deep_copy(exec, d_nlocal, nlocal);
   Kokkos::deep_copy(exec, d_nghost, nghost);
   if (rebuild_edges) {
-    // Counts change only at reneighbor; the max-allreduce keeps the overflow error collective.
-    int edge_overflow = 0;
-    int edge_count = 0;
-    Kokkos::deep_copy(edge_overflow, d_edge_overflow);
-    Kokkos::deep_copy(edge_count, d_edge_count);
-    const int local_counts[4] = {nall, edge_count, edge_overflow, nlocal};
-    int global_counts[4] = {nall, edge_count, edge_overflow, nlocal};
-    MPI_Allreduce(local_counts, global_counts, 4, MPI_INT, MPI_MAX, world);
-    if (global_counts[0] > bundle.contract.max_atoms)
-      error->all(FLERR, "LAMMPS-JAX atom capacity exceeded: global max {} atoms, capacity {}",
-                 global_counts[0], bundle.contract.max_atoms);
-    if (bundle.contract.max_owned > 0 && global_counts[3] > bundle.contract.max_owned)
-      error->all(FLERR, "LAMMPS-JAX owned-row capacity exceeded: global max {} owned atoms, "
-                 "capacity {}", global_counts[3], bundle.contract.max_owned);
-    if (global_counts[2])
-      error->all(FLERR, "LAMMPS-JAX edge capacity exceeded: global max {} edges, capacity {}",
-                 global_counts[1], bundle.contract.max_edges);
-    cached_edge_count = edge_count;
-    edge_cache_valid = true;
+    // Counts drain to pinned rows async; they are read after execution, so no fence here.
+    Kokkos::deep_copy(exec, h_edge_count, d_edge_count);
+    Kokkos::deep_copy(exec, h_edge_overflow, d_edge_overflow);
   }
 
-  CUevent ready_event = nullptr;
+  // Row limits abort pre-launch: mid-execution exchanges copy nall rows into capacity buffers.
+  {
+    const int local_rows[2] = {nall, nlocal};
+    int global_rows[2] = {nall, nlocal};
+    MPI_Allreduce(local_rows, global_rows, 2, MPI_INT, MPI_MAX, world);
+    if (global_rows[0] > bundle.contract.max_atoms)
+      error->all(FLERR, "LAMMPS-JAX atom capacity exceeded: global max {} atoms, capacity {}",
+                 global_rows[0], bundle.contract.max_atoms);
+    if (bundle.contract.max_owned > 0 && global_rows[1] > bundle.contract.max_owned)
+      error->all(FLERR, "LAMMPS-JAX owned-row capacity exceeded: global max {} owned atoms, "
+                 "capacity {}", global_rows[1], bundle.contract.max_owned);
+  }
+
+  pjrt::ExecutionResult result;
   try {
-    // The catch below destroys the event on any failure past creation.
-    if (cuEventCreate(&ready_event, CU_EVENT_DISABLE_TIMING) != CUDA_SUCCESS)
-      throw std::runtime_error("Failed to create CUDA event for LAMMPS-JAX inputs");
-    if (cuEventRecord(ready_event, stream) != CUDA_SUCCESS)
+    if (cuEventRecord(input_ready_event, stream) != CUDA_SUCCESS)
       throw std::runtime_error("Failed to record CUDA event for LAMMPS-JAX inputs");
-    pjrt::ExecutionRequest request = make_request(stream, ready_event);
+    pjrt::ExecutionRequest request = make_request(stream, input_ready_event);
     // Execution runs on a worker while this thread services exchanges through LAMMPS comm.
     request.nlocal = nlocal;
     request.nghost = nghost;
-    pjrt::ExecutionResult result = energy_only_step ? runtime->execute_energy(request)
+    result = energy_only_step ? runtime->execute_energy(request)
         : include_energy ? runtime->execute_energy_force(request)
                          : runtime->execute_force(request);
-    if (include_energy) eng_vdwl += scale * result.energy;
-    if (!energy_only_step) {
-      runtime->consume_force_output(stream, [&](CUdeviceptr force_output) {
-        add_model_forces(force_output, f, nlocal, nall);
-      });
-      if (vflag_fdotr) {
-        // Device f-dot-r over owned and ghost rows, stream-ordered after the force add.
-        EV_FLOAT virial_acc;
-        Kokkos::parallel_reduce("LAMMPSJAX::virial_fdotr",
-                                Kokkos::RangePolicy<LMPDeviceType>(exec, 0, nall),
-                                VirialFDotRFunctor<LMPDeviceType>{x, f}, virial_acc);
-        for (int n = 0; n < 6; ++n) virial[n] += static_cast<double>(virial_acc.v[n]);
-        vflag_fdotr = 0;
-      }
-    }
   } catch (const std::exception &e) {
-    if (ready_event != nullptr) cuEventDestroy(ready_event);
     // error->one: execution failures are rank-local and cannot collectivize.
     error->one(FLERR, "LAMMPS-JAX compute failed: {}", e.what());
   }
-  if (ready_event != nullptr) cuEventDestroy(ready_event);
+
+  if (rebuild_edges) {
+    // Overflow only truncates the packed list, so the collective abort can wait until here.
+    exec.fence();
+    const int local_counts[2] = {h_edge_count(), h_edge_overflow()};
+    int global_counts[2] = {local_counts[0], local_counts[1]};
+    MPI_Allreduce(local_counts, global_counts, 2, MPI_INT, MPI_MAX, world);
+    if (global_counts[1])
+      error->all(FLERR, "LAMMPS-JAX edge capacity exceeded: global max {} edges, capacity {}",
+                 global_counts[0], bundle.contract.max_edges);
+    cached_edge_count = local_counts[0];
+  }
+
+  if (include_energy) eng_vdwl += scale * result.energy;
+  if (!energy_only_step) {
+    try {
+      runtime->consume_force_output(stream, [&](CUdeviceptr force_output) {
+        add_model_forces(force_output, f, nlocal, nall);
+      });
+    } catch (const std::exception &e) {
+      error->one(FLERR, "LAMMPS-JAX compute failed: {}", e.what());
+    }
+    if (vflag_fdotr) {
+      // Device f-dot-r over owned and ghost rows, stream-ordered after the force add.
+      EV_FLOAT virial_acc;
+      Kokkos::parallel_reduce("LAMMPSJAX::virial_fdotr",
+                              Kokkos::RangePolicy<LMPDeviceType>(exec, 0, nall),
+                              VirialFDotRFunctor<LMPDeviceType>{x, f}, virial_acc);
+      for (int n = 0; n < 6; ++n) virial[n] += static_cast<double>(virial_acc.v[n]);
+      vflag_fdotr = 0;
+    }
+  }
 #endif
 }

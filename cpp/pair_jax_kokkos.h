@@ -73,7 +73,6 @@ class PairJaxKokkos : public Pair, public KokkosBase {
   double scale = 1.0;
   bool model_loaded = false;
   // The packed edge graph persists between reneighbor steps; cached count is the launch extent.
-  bool edge_cache_valid = false;
   int cached_edge_count = 0;
   // Active model-comm site state, valid only inside service_model_comm.
   float *comm_rows = nullptr;
@@ -101,6 +100,7 @@ class PairJaxKokkos : public Pair, public KokkosBase {
   using int_view = Kokkos::View<int *, device_type>;
   using bool_view = Kokkos::View<bool *, device_type>;
   using scalar_int_view = Kokkos::View<int, device_type>;
+  using scalar_int_pinned_view = Kokkos::View<int, Kokkos::CudaHostPinnedSpace>;
 
   void pack_atoms(int nall, const x_view &x, const type_view &type);
   template <typename Scalar>
@@ -142,9 +142,13 @@ class PairJaxKokkos : public Pair, public KokkosBase {
   scalar_int_view d_nghost;
   scalar_int_view d_edge_count;
   scalar_int_view d_edge_overflow;
+  // Counts drain here asynchronously; the capacity check reads them after execution.
+  scalar_int_pinned_view h_edge_count;
+  scalar_int_pinned_view h_edge_overflow;
   int_view d_senders;
   int_view d_receivers;
   bool_view d_edge_mask;
+  CUevent input_ready_event = nullptr;
 #endif
 };
 

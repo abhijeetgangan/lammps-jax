@@ -147,8 +147,6 @@ ExecutionResult execute_loaded(const PluginLibrary &library, PJRT_Client *client
                                PJRT_LoadedExecutable *executable,
                                const ExecutionRequest &request, bool with_energy,
                                bool with_forces, OutputLifetime &output_lifetime,
-                               std::vector<DeviceBufferSpec> &cached_specs,
-                               std::vector<BufferPtr> &cached_views,
                                PJRT_ExecuteContext *execute_context = nullptr)
 {
   // Fused programs return energy and forces, single-purpose one; arity checked at compile.
@@ -166,24 +164,15 @@ ExecutionResult execute_loaded(const PluginLibrary &library, PJRT_Client *client
 
   ExecutionResult result;
 
-  const bool reuse_views =
-      cached_specs.size() == request.inputs.size() &&
-      std::equal(cached_specs.begin(), cached_specs.end(), request.inputs.begin(),
-                 [](const DeviceBufferSpec &a, const DeviceBufferSpec &b) {
-                   return a.pointer == b.pointer && a.dims == b.dims &&
-                          a.element_type == b.element_type;
-                 });
-  if (!reuse_views) {
-    cached_views.clear();
-    cached_views.reserve(request.inputs.size());
-    for (const auto &input : request.inputs)
-      cached_views.emplace_back(create_input_view(library, client, device, input, input_stream));
-    cached_specs = request.inputs;
-  }
+  // Recreated every execution so each view's definition event lands behind the input-ready wait.
+  std::vector<BufferPtr> input_views;
+  input_views.reserve(request.inputs.size());
+  for (const auto &input : request.inputs)
+    input_views.emplace_back(create_input_view(library, client, device, input, input_stream));
 
   std::vector<PJRT_Buffer *> input_buffers;
-  input_buffers.reserve(cached_views.size());
-  for (auto &input : cached_views) input_buffers.push_back(input.get());
+  input_buffers.reserve(input_views.size());
+  for (auto &input : input_views) input_buffers.push_back(input.get());
 
   std::vector<PJRT_Buffer *> output_buffers(num_outputs, nullptr);
   PJRT_Buffer **argument_lists[1] = {input_buffers.data()};
@@ -286,8 +275,6 @@ void Runtime::close()
     model_comm_.reset();
   }
   output_lifetime_.reset();
-  cached_input_views_.clear();
-  cached_input_specs_.clear();
   force_executable_.reset();
   energy_executable_.reset();
   energy_force_executable_.reset();
@@ -401,7 +388,6 @@ ExecutionResult Runtime::execute_force(const ExecutionRequest &request)
     return execute_loaded(library_, session_.client(), session_.device(),
                           session_.input_stream_for(library_), force_executable_.get(),
                           request, false, true, output_lifetime_,
-                          cached_input_specs_, cached_input_views_,
                           model_comm_ ? model_comm_->execute_context() : nullptr);
   });
 }
@@ -412,7 +398,6 @@ ExecutionResult Runtime::execute_energy(const ExecutionRequest &request)
     return execute_loaded(library_, session_.client(), session_.device(),
                           session_.input_stream_for(library_), energy_executable_.get(),
                           request, true, false, output_lifetime_,
-                          cached_input_specs_, cached_input_views_,
                           model_comm_ ? model_comm_->execute_context() : nullptr);
   });
 }
@@ -423,7 +408,6 @@ ExecutionResult Runtime::execute_energy_force(const ExecutionRequest &request)
     return execute_loaded(library_, session_.client(), session_.device(),
                           session_.input_stream_for(library_), energy_force_executable_.get(),
                           request, true, true, output_lifetime_,
-                          cached_input_specs_, cached_input_views_,
                           model_comm_ ? model_comm_->execute_context() : nullptr);
   });
 }
