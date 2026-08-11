@@ -1,0 +1,13 @@
+[deps]
+ACEpotentials = "3b96b61c-0fcc-4693-95ed-1ef9f35fcc53"
+Base64 = "2a0f44e3-6c83-55bd-87e4-b1978d98bd5f"
+Enzyme = "7da242da-08ed-463a-9acd-ee780be4f1d9"
+LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
+Polynomials4ML = "03c4bcba-a943-47e9-bfa1-b1661fc2974f"
+Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
+Reactant = "3c362404-f566-11ee-1572-e11a4b42c853"
+SparseArrays = "2f01184e-e22b-5df5-ae63-d93ebab69eaf"
+StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
+
+[compat]
+ACEpotentials = "0.10"
