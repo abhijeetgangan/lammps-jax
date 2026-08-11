@@ -207,6 +207,7 @@ def export_model(
     custom_call_targets: tuple[str, ...] = (),
     n_species: int | None = None,
     max_owned: int | None = None,
+    pair_sum: bool = False,
 ) -> dict[str, Any]:
     """Export a JAX model to a fixed-capacity sparse LAMMPS-JAX JSON bundle.
 
@@ -267,6 +268,8 @@ def export_model(
             "half_edges requires n_hops > 1 or a communicating export; the "
             "single-hop packer does not deduplicate edge directions"
         )
+    if pair_sum and (comm or n_hops > 1 or half_edges or force_output == EDGE_FORCE):
+        raise ValueError("pair_sum needs a plain full-pairing energy export")
     if max_owned is not None and not (comm and 0 < max_owned <= max_atoms):
         raise ValueError(
             "max_owned needs a communicating export and 0 < max_owned <= "
@@ -483,6 +486,7 @@ def export_model(
                 if not target.startswith("__gpu$")
             ),
             "uses_box": uses_box,
+            "pair_sum": pair_sum,
         },
     }
     if n_species is not None:

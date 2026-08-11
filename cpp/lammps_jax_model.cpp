@@ -134,6 +134,13 @@ bool get_bool(const std::string &json, const std::string &key)
   throw std::runtime_error("Expected boolean for key: " + key);
 }
 
+bool get_bool_or(const std::string &json, const std::string &key, bool fallback)
+{
+  const std::string quoted = "\"" + key + "\"";
+  if (json.find(quoted) == std::string::npos) return fallback;
+  return get_bool(json, key);
+}
+
 // Validation only: the sole supported layout needs no runtime representation.
 void parse_input_layout(const std::string &value)
 {
@@ -226,6 +233,7 @@ ModelBundle load_bundle_file(const std::string &path)
   bundle.contract.comm_widths = get_int_array_or(json, "comm_widths");
   bundle.contract.custom_call_targets = get_string_array_or(json, "custom_call_targets");
   bundle.contract.uses_box = get_bool(json, "uses_box");
+  bundle.contract.pair_sum = get_bool_or(json, "pair_sum", false);
   bundle.contract.n_species = get_int_or(json, "n_species", 0);
   if (bundle.contract.n_species < 0) throw std::runtime_error("Invalid n_species in bundle");
   bundle.contract.max_owned = get_int_or(json, "max_owned", 0);

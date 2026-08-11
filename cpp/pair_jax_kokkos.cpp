@@ -623,8 +623,9 @@ void PairJaxKokkos::init_style()
                      bundle.contract.n_hops);
     else if (force->newton_pair)
       utils::logmesg(lmp,
-                     "LAMMPS-JAX: using newton pair on with a Kokkos half neighbor list; "
-                     "ghost force rows are accumulated for LAMMPS reverse communication.\n");
+                     "LAMMPS-JAX: using newton pair on with a Kokkos {} neighbor list; "
+                     "ghost force rows are accumulated for LAMMPS reverse communication.\n",
+                     edge_force_enabled() || bundle.contract.pair_sum ? "half" : "full");
     if (bundle.programs.energy_and_forces_mlir.empty())
       utils::logmesg(lmp,
                      "LAMMPS-JAX: force-only bundle; pair energy is reported as zero.\n");
@@ -675,9 +676,11 @@ void PairJaxKokkos::init_style()
     request->set_kokkos_host(false);
     return;
   }
-  // Newton on: half list over owned rows. Newton off: full list, no REQ_GHOST.
-  auto request = force->newton_pair ? neighbor->add_request(this)
-                                    : neighbor->add_request(this, NeighConst::REQ_FULL);
+  // Full list keeps owned rows complete; edge-force and pair-sum bundles keep the half list.
+  const bool half_list_ok = edge_force_enabled() || bundle.contract.pair_sum;
+  auto request = half_list_ok && force->newton_pair
+      ? neighbor->add_request(this)
+      : neighbor->add_request(this, NeighConst::REQ_FULL);
   request->set_kokkos_device(true);
   request->set_kokkos_host(false);
 }
@@ -729,9 +732,10 @@ void PairJaxKokkos::pack_edges(NeighListKokkos<PairJaxKokkos::device_type> *klis
       error->one(FLERR,
                  "LAMMPS-JAX neighbor pack index overflows int; reduce the bundle "
                  "max_atoms or the neigh_modify one setting");
-    // Ghost and comm full lists already carry both edge directions.
+    // Only edge-linear energy bundles keep the half list needing duplication.
     const bool duplicate_reverse_edges =
-        force->newton_pair && !edge_force_enabled() && !multi_hop && !comm_enabled();
+        force->newton_pair && bundle.contract.pair_sum && !edge_force_enabled() &&
+        !multi_hop && !comm_enabled();
     Kokkos::parallel_for(
         "LAMMPSJAX::pack_neighbors",
         Kokkos::RangePolicy<LMPDeviceType>(exec, 0, num_rows * max_neighbors_per_atom),

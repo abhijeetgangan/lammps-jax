@@ -56,6 +56,8 @@ struct ModelContract {
   std::vector<std::string> custom_call_targets;
   // Model takes the cell as a trailing [3,3] row-vector matrix at the contract precision.
   bool uses_box = false;
+  // Pair-sum energies: any row may absorb an edge, so the half list stays exact.
+  bool pair_sum = false;
   // Species the model distinguishes; more atom types abort pair_coeff. 0 means species-blind.
   int n_species = 0;
   // Static owned-row bound for models that truncate per-node work. 0 means untruncated.

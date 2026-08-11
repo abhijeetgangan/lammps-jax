@@ -1,8 +1,4 @@
-"""EAM through the ghost bundle path, checked against a dense reference.
-
-EAM needs the n_hops=2 contract: F(rho) couples an atom's force to its neighbors'
-neighborhoods, and both single-hop conventions get forces wrong.
-"""
+"""EAM through the ghost bundle path, checked against a dense reference."""
 
 import contextlib
 
