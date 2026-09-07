@@ -101,10 +101,6 @@ EXPORTS = {
                    "examples/potentials/CuZr.eam.alloy.gz",
                    "--max-atoms", "3072", "--edges-per-atom", "32",
                    "--half-edges", "--mode", "comm", "--force-output", "edge")),
-    "cuzr_half": ("export_model.py",
-                  ("eam", "{output}", "--setfl", "examples/potentials/CuZr.eam.alloy.gz",
-                   "--max-atoms", "8192", "--edges-per-atom", "64",
-                   "--half-edges", "--precision", "float64")),
     "cuzr_uniq": ("export_model.py",
                   ("eam", "{output}", "--setfl",
                    "examples/potentials/CuZr.eam.alloy.gz",
@@ -335,10 +331,6 @@ CASES = {
         pressure=True, dense="eam_embedded"),
     "cuzr_static": dict(
         kind="static", deck="cuzr_static", bundle="cuzr", newton="on",
-        pressure=True, float64=True, dense="cuzr",
-        energy_tol=1.0e-12, pressure_tol=1.0e-8),
-    "cuzr_half_static": dict(
-        kind="static", deck="cuzr_static", bundle="cuzr_half", newton="on",
         pressure=True, float64=True, dense="cuzr",
         energy_tol=1.0e-12, pressure_tol=1.0e-8),
     "cuzr_edge_static": dict(
@@ -937,9 +929,8 @@ def test_nve_trajectory(runner, case):
 @pytest.mark.parametrize(
     "case_a, case_b",
     [("eam_comm_static", "eam_ghostx_static"),
-     ("cuzr_half_static", "cuzr_static"),
      ("eam_comm_half_static", "eam_comm_static")],
-    ids=["eam", "cuzr-pairing", "eam-comm-pairing"],
+    ids=["eam", "eam-comm-pairing"],
 )
 def test_scheme_cross_agreement(runner, case_a, case_b):
     """Same weights and coordinates under two schemes or edge packings.

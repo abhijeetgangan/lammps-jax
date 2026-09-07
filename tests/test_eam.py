@@ -1,6 +1,10 @@
 """EAM through the ghost bundle path, checked against a dense reference."""
 
 import contextlib
+import os
+import subprocess
+import sys
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -61,7 +65,7 @@ def dense_reference():
 
 @pytest.fixture(scope="module")
 def single_hop_fused():
-    """Default n_hops=1 fused wrapper, shared by the wrongness tests."""
+    """One-hop fused wrapper without owned-row masking, shared by the decomposition tests."""
     _force, _energy, fused_fn = wrap_energy_fn(
         make_eam_energy(cutoff=CUTOFF, **PARAMS), max_atoms=MAX_ATOMS, call_model=call_model
     )
@@ -119,7 +123,7 @@ def test_eam_graph_matches_dense(dtype):
 
 
 def test_eam_ghost_decomposition_matches_dense(dense_reference):
-    """Emulates the n_hops=2 pair-style path through the export wrappers."""
+    """Emulates the two-hop pair-style path (pair-embedding and MACE ghost exports) with EAM."""
     positions_np, ref_energy, ref_forces = dense_reference
     _force, energy_fn, fused_fn = wrap_energy_fn(
         make_eam_energy(cutoff=CUTOFF, **PARAMS),
@@ -167,11 +171,30 @@ def test_eam_newton_off_singlehop_gets_forces_wrong(dense_reference, single_hop_
     assert not np.allclose(total_forces, ref_forces, atol=1e-3)
 
 
-def test_eam_default_single_hop_export_is_wrong_multi_rank(dense_reference, single_hop_fused):
-    """EAM exported with the default n_hops=1 is silently wrong on two ranks.
+def test_eam_single_hop_newton_on_matches_dense(dense_reference, single_hop_fused):
+    """The shipped EAM path: one hop, complete owned rows, ghost force rows summed home."""
+    positions_np, ref_energy, ref_forces = dense_reference
+
+    total_energy = 0.0
+    total_forces = np.zeros_like(positions_np, dtype=np.float64)
+    for present, n_owned in two_domains(positions_np, x_split=3.0, halo=CUTOFF):
+        local_positions = positions_np[present]
+        senders, receivers = edges_within_cutoff(local_positions, CUTOFF)
+        owned_rows = senders < n_owned
+        args = abi_args(local_positions, n_owned, senders[owned_rows], receivers[owned_rows])
+        energy, forces = single_hop_fused(*args)
+        total_energy += float(energy)
+        np.add.at(total_forces, present, np.asarray(forces[: len(present)], dtype=np.float64))
+
+    assert total_energy == pytest.approx(ref_energy, abs=1e-3)
+    assert np.allclose(total_forces, ref_forces, atol=1e-3)
+
+
+def test_eam_one_rank_per_pair_packing_is_wrong_multi_rank(dense_reference, single_hop_fused):
+    """EAM is silently wrong when each boundary pair is packed on one rank only.
 
     Each rank embeds a partial density for boundary atoms and F(rho) is
-    nonlinear, so EAM bundles carry n_hops=2.
+    nonlinear; the pair style hands energy bundles full rows instead.
     """
     positions_np, ref_energy, ref_forces = dense_reference
     n_atoms = len(positions_np)
@@ -497,3 +520,44 @@ def test_export_eam_bundle(tmp_path):
     assert data["contract"]["newton"] == "on"
     assert data["contract"]["force_output"] == "atom-force"
     assert "func.func public @main" in program_text(data, "energy_and_forces_mlir")
+
+
+EXPORT_CLI = Path(__file__).resolve().parents[1] / "examples" / "export_model.py"
+
+
+def run_export_cli(output, *extra):
+    return subprocess.run(
+        [sys.executable, str(EXPORT_CLI), "eam", str(output),
+         "--max-atoms", "8", "--edges-per-atom", "4", *extra],
+        capture_output=True, text=True, env={**os.environ, "JAX_PLATFORMS": "cpu"},
+    )
+
+
+@pytest.mark.parametrize(
+    ("extra", "n_hops", "pairing"),
+    [((), 1, "full"),
+     (("--pair-embedding", "0.3"), 2, "full"),
+     (("--mode", "comm", "--half-edges"), 1, "half-unique")],
+    ids=["plain", "pair-embedding", "comm-half"],
+)
+def test_export_cli_hop_selection(tmp_path, extra, n_hops, pairing):
+    import json
+
+    output = tmp_path / "bundle.json"
+    result = run_export_cli(output, *extra)
+    assert result.returncode == 0, result.stderr
+    contract = json.loads(output.read_text())["contract"]
+    assert contract["n_hops"] == n_hops
+    assert contract["newton"] == "on"
+    assert contract["edge_pairing"] == pairing
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [("--half-edges",), ("--setfl", "examples/potentials/CuZr.eam.alloy.gz", "--force-output", "edge")],
+    ids=["ghost-half-edges", "ghost-edge-force"],
+)
+def test_export_cli_rejects_ghost_half_edge_forms(tmp_path, extra):
+    result = run_export_cli(tmp_path / "bundle.json", *extra)
+    assert result.returncode == 2
+    assert "--mode comm" in result.stderr

@@ -1,7 +1,7 @@
 """EAM models in exported-graph form.
 
 Analytic Finnis-Sinclair plus tabulated DYNAMO setfl and funcfl, matching native
-pair_eam interpolation. Tabulated exports use metal units; export uses n_hops=2.
+pair_eam interpolation. Tabulated exports use metal units at one hop.
 """
 
 import gzip
