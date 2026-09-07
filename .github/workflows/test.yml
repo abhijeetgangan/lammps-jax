@@ -22,6 +22,17 @@ jobs:
       - run: uv pip install -e '.[test]'
       - run: .venv/bin/python -m pytest tests/test_${{ matrix.suite }}.py
 
+  dist:
+    runs-on: ubuntu-latest
+    env:
+      JAX_PLATFORMS: cpu
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv venv .venv --python 3.13
+      - run: uv pip install -e '.[dist,test]'
+      - run: .venv/bin/python -m pytest tests/test_dist_parallel.py
+
   nequip:
     runs-on: ubuntu-latest
     env:

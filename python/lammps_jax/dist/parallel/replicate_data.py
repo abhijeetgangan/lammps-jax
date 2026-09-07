@@ -1,109 +1,218 @@
+"""Replicated-data atom-decomposition parallelism for jax-md energy functions.
+
+Each of D devices owns a block of M = N / D atoms, all-gathers every block
+into the full (N, 3) array, and evaluates its block energy against it. Block
+energies are psummed; forces are the block-energy gradient over all N
+coordinates, folded across devices. ``lax.all_gather`` is the expand, tiled
+``lax.psum_scatter`` the fold, autodiff the reverse communication.
+
+References:
+    S. Plimpton, "Fast Parallel Algorithms for Short-Range Molecular
+    Dynamics", J. Comput. Phys. 117, 1-19 (1995),
+    doi:10.1006/jcph.1995.1039.
+    A. P. Thompson et al., "LAMMPS - a flexible simulation tool for
+    particle-based materials modeling at the atomic, meso, and continuum
+    scales", Comput. Phys. Commun. 271, 108171 (2022),
+    doi:10.1016/j.cpc.2021.108171.
+    W. Smith, "Molecular dynamics on hypercube parallel computers",
+    Comput. Phys. Commun. 62, 229-248 (1991),
+    doi:10.1016/0010-4655(91)90097-5: the replicated-data name.
+    G. C. Fox et al., "Solving Problems on Concurrent Processors",
+    Prentice-Hall (1988): origin of the expand/fold collectives.
+"""
+
 import inspect
 from functools import partial
-from typing import Callable, NamedTuple, Optional, Union
+from typing import Callable, NamedTuple, Optional
+
 import jax
 import jax.numpy as jnp
 import numpy as onp
-from jax import grad, lax
+from jax import grad, lax, shard_map
 from jax.ops import segment_sum
-try:
-    from jax import shard_map
-except ImportError:
-    from jax.experimental.shard_map import shard_map
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from jax_md import space
+
 Array = jnp.ndarray
-BoxLike = Union[float, Array]
+
+
 class DomainConfig(NamedTuple):
+    """Mesh and block-size description shared by the sharded wrappers.
+
+    Attributes:
+        mesh: 1-D device mesh of D devices.
+        n_domains: Number of devices D.
+        n_atoms_per_domain: Atoms owned per device M; N = D * M.
+    """
+
     mesh: Mesh
     n_domains: int
     n_atoms_per_domain: int
-    box_size: Array
-    r_cutoff: float
     axis_name: str
-def create_config(n_domains: int, n_atoms_per_domain: int, box_size: BoxLike, r_cutoff: float, mesh: Optional[Mesh]=None, axis_name: str='i') -> DomainConfig:
+
+
+def default_mesh(n_domains: int, axis_name: str) -> Mesh:
+    """1-D mesh over the first D local devices; raises ValueError when fewer exist."""
+    devices = jax.devices()
+    if n_domains > len(devices):
+        raise ValueError(f'n_domains {n_domains} exceeds the {len(devices)} local devices')
+    return Mesh(devices[:n_domains], axis_names=(axis_name,))
+
+
+def check_mesh(mesh: Mesh, axis_name: str, n_domains: int) -> None:
+    """Raises ValueError unless mesh has n_domains devices along axis_name."""
+    if axis_name not in mesh.axis_names or mesh.shape[axis_name] != n_domains:
+        raise ValueError(f'mesh axis {axis_name!r} must hold n_domains {n_domains} devices, '
+                         f'got {dict(mesh.shape)}')
+
+
+def create_config(n_domains: int, n_atoms_per_domain: int,
+                  mesh: Optional[Mesh] = None,
+                  axis_name: str = 'i') -> DomainConfig:
+    """Builds a DomainConfig; mesh defaults to the first D local devices.
+
+    Raises:
+        ValueError: mesh does not hold n_domains devices along axis_name.
+    """
     if mesh is None:
-        devices = jax.devices()[:n_domains]
-        mesh = Mesh(devices, axis_names=(axis_name,))
-    return DomainConfig(mesh=mesh, n_domains=n_domains, n_atoms_per_domain=n_atoms_per_domain, box_size=jnp.asarray(box_size), r_cutoff=r_cutoff, axis_name=axis_name)
-def _place_on_mesh(R_flat: Array, n_domains: int, n_per_domain: int, sharding: NamedSharding) -> Array:
+        mesh = default_mesh(n_domains, axis_name)
+    check_mesh(mesh, axis_name, n_domains)
+    return DomainConfig(mesh=mesh, n_domains=n_domains,
+                        n_atoms_per_domain=n_atoms_per_domain,
+                        axis_name=axis_name)
+
+
+def place_on_mesh(R_flat: Array, n_domains: int, n_per_domain: int,
+                  sharding: NamedSharding) -> Array:
+    """Reshapes (N, 3) positions to (D, M, 3) and places one block per device."""
     expected = (n_domains, n_per_domain, 3)
     if R_flat.shape == expected:
         if getattr(R_flat, 'sharding', None) == sharding:
             return R_flat
         return jax.device_put(R_flat, sharding)
     return jax.device_put(R_flat.reshape(*expected), sharding)
+
+
+def owned_start(axis_name: str, n_per_domain: int) -> Array:
+    """This device's first owned atom index, in the dynamic-slice index dtype."""
+    index_dtype = jnp.int64 if bool(getattr(jax.config, 'jax_enable_x64', False)) else jnp.int32
+    return lax.convert_element_type(lax.axis_index(axis_name) * n_per_domain, index_dtype)
+
+
+def fold_forces(grad_all: Array, start: Array, n_per_domain: int,
+                axis_name: str, use_reduce_scatter: bool) -> Array:
+    """Folds per-device (N, 3) partial gradients into owned (M, 3) forces."""
+    if use_reduce_scatter:
+        return -lax.psum_scatter(grad_all, axis_name=axis_name,
+                                 scatter_dimension=0, tiled=True)
+    grad_total = lax.psum(grad_all, axis_name=axis_name)
+    return -lax.dynamic_slice_in_dim(grad_total, start, n_per_domain, axis=0)
+
+
 def make_sharded_energy(energy_fn: Callable, config: DomainConfig) -> Callable:
+    """Replicated-data total energy of a domain energy.
+
+    Args:
+        energy_fn: ``(R_all (N, 3), local_start, n_local) -> scalar`` energy of the owned block.
+        config: Mesh and block sizes; atom i is owned by device i // M.
+
+    Returns:
+        ``(N, 3) or (D, M, 3) positions -> scalar total energy``.
+    """
     mesh = config.mesh
     axis_name = config.axis_name
     n_domains = config.n_domains
     n_per_domain = config.n_atoms_per_domain
     sharding = NamedSharding(mesh, P(axis_name))
-    @partial(shard_map, mesh=mesh, in_specs=(P(axis_name),), out_specs=P(), check_vma=False)
-    def _sharded_energy(R_local):
-        device_idx = lax.axis_index(axis_name)
+
+    @partial(shard_map, mesh=mesh, in_specs=(P(axis_name),), out_specs=P(),
+             check_vma=False)
+    def sharded_energy(R_local):
         R_all = lax.all_gather(R_local, axis_name=axis_name).reshape(-1, 3)
-        start = device_idx * n_per_domain
+        start = owned_start(axis_name, n_per_domain)
         E_local = energy_fn(R_all, start, n_per_domain)
         return lax.psum(E_local, axis_name=axis_name)
+
     @jax.jit
     def wrapped(R_flat):
-        R_on_mesh = _place_on_mesh(R_flat, n_domains, n_per_domain, sharding)
-        return _sharded_energy(R_on_mesh)
+        R_on_mesh = place_on_mesh(R_flat, n_domains, n_per_domain, sharding)
+        return sharded_energy(R_on_mesh)
+
     return wrapped
-def make_sharded_force(energy_fn: Callable, config: DomainConfig, use_reduce_scatter: bool=False) -> Callable:
+
+
+def make_sharded_force(energy_fn: Callable, config: DomainConfig,
+                       use_reduce_scatter: bool = False) -> Callable:
+    """Force counterpart of ``make_sharded_energy``: ``positions -> (N, 3) forces``.
+
+    Args:
+        use_reduce_scatter: Tiled ``psum_scatter`` fold, else psum then slice.
+    """
     mesh = config.mesh
     axis_name = config.axis_name
     n_domains = config.n_domains
     n_per_domain = config.n_atoms_per_domain
     sharding = NamedSharding(mesh, P(axis_name))
-    @partial(shard_map, mesh=mesh, in_specs=(P(axis_name),), out_specs=P(axis_name), check_vma=False)
-    def _sharded_force(R_local):
-        device_idx = lax.axis_index(axis_name)
+
+    @partial(shard_map, mesh=mesh, in_specs=(P(axis_name),),
+             out_specs=P(axis_name), check_vma=False)
+    def sharded_force(R_local):
         R_all = lax.all_gather(R_local, axis_name=axis_name).reshape(-1, 3)
-        start = device_idx * n_per_domain
-        index_dtype = jnp.int64 if bool(getattr(jax.config, 'jax_enable_x64', False)) else jnp.int32
-        start = lax.convert_element_type(start, index_dtype)
+        start = owned_start(axis_name, n_per_domain)
         grad_all = grad(lambda r: energy_fn(r, start, n_per_domain))(R_all)
-        if use_reduce_scatter:
-            return -lax.psum_scatter(grad_all, axis_name=axis_name, scatter_dimension=0, tiled=True)
-        grad_total = lax.psum(grad_all, axis_name=axis_name)
-        return -lax.dynamic_slice_in_dim(grad_total, start, n_per_domain, axis=0)
+        return fold_forces(grad_all, start, n_per_domain, axis_name, use_reduce_scatter)
+
     @jax.jit
     def wrapped(R_flat):
-        R_on_mesh = _place_on_mesh(R_flat, n_domains, n_per_domain, sharding)
-        return _sharded_force(R_on_mesh).reshape(-1, 3)
+        R_on_mesh = place_on_mesh(R_flat, n_domains, n_per_domain, sharding)
+        return sharded_force(R_on_mesh).reshape(-1, 3)
+
     return wrapped
-def make_sharded_energy_force(energy_fn: Callable, config: DomainConfig, use_reduce_scatter: bool=False) -> Callable:
+
+
+def make_sharded_energy_force(energy_fn: Callable, config: DomainConfig,
+                              use_reduce_scatter: bool = False) -> Callable:
+    """make_sharded_energy and make_sharded_force in one call: ``positions -> (energy, (N, 3) forces)``."""
     mesh = config.mesh
     axis_name = config.axis_name
     n_domains = config.n_domains
     n_per_domain = config.n_atoms_per_domain
     sharding = NamedSharding(mesh, P(axis_name))
-    @partial(shard_map, mesh=mesh, in_specs=(P(axis_name),), out_specs=(P(), P(axis_name)), check_vma=False)
-    def _sharded_energy_force(R_local):
-        device_idx = lax.axis_index(axis_name)
+
+    @partial(shard_map, mesh=mesh, in_specs=(P(axis_name),),
+             out_specs=(P(), P(axis_name)), check_vma=False)
+    def sharded_energy_force(R_local):
         R_all = lax.all_gather(R_local, axis_name=axis_name).reshape(-1, 3)
-        start = device_idx * n_per_domain
-        index_dtype = jnp.int64 if bool(getattr(jax.config, 'jax_enable_x64', False)) else jnp.int32
-        start = lax.convert_element_type(start, index_dtype)
-        E_local, grad_all = jax.value_and_grad(lambda r: energy_fn(r, start, n_per_domain))(R_all)
+        start = owned_start(axis_name, n_per_domain)
+        E_local, grad_all = jax.value_and_grad(
+            lambda r: energy_fn(r, start, n_per_domain))(R_all)
         E_total = lax.psum(E_local, axis_name=axis_name)
-        if use_reduce_scatter:
-            F_local = -lax.psum_scatter(grad_all, axis_name=axis_name, scatter_dimension=0, tiled=True)
-        else:
-            grad_total = lax.psum(grad_all, axis_name=axis_name)
-            F_local = -lax.dynamic_slice_in_dim(grad_total, start, n_per_domain, axis=0)
+        F_local = fold_forces(grad_all, start, n_per_domain, axis_name, use_reduce_scatter)
         return (E_total, F_local)
+
     @jax.jit
     def wrapped(R_flat):
-        R_on_mesh = _place_on_mesh(R_flat, n_domains, n_per_domain, sharding)
-        E, F = _sharded_energy_force(R_on_mesh)
+        R_on_mesh = place_on_mesh(R_flat, n_domains, n_per_domain, sharding)
+        E, F = sharded_energy_force(R_on_mesh)
         return (E, F.reshape(-1, 3))
+
     return wrapped
-def domain_energy_from_pair(pair_energy_fn: Callable, displacement_fn: Callable) -> Callable:
-    metric = space.metric(displacement_fn)
-    compute_distances = lambda R_local, R_all: jax.vmap(lambda r_i: jax.vmap(lambda r_j: metric(r_i, r_j))(R_all))(R_local)
+
+
+def domain_energy_from_pair(pair_energy_fn: Callable,
+                            displacement_fn: Callable) -> Callable:
+    """Builds a dense-distance domain energy from an isotropic pair potential.
+
+    Args:
+        pair_energy_fn: Vectorized ``dr -> energy`` over a distance array.
+
+    Returns:
+        ``(R_all (N, 3), local_start, n_local) -> scalar`` over the (M, N) distance
+        matrix with the diagonal masked and each pair weighted 0.5.
+    """
+    compute_distances = lambda R_local, R_all: space.distance(jax.vmap(
+        lambda r_i: jax.vmap(lambda r_j: displacement_fn(r_i, r_j))(R_all))(R_local))
+
     def domain_energy(R_all, local_start, n_local):
         n_all = R_all.shape[0]
         start = lax.convert_element_type(local_start, jnp.int32)
@@ -115,11 +224,25 @@ def domain_energy_from_pair(pair_energy_fn: Callable, displacement_fn: Callable)
         safe_dr = jnp.where(diag_mask, jnp.ones_like(dr), dr)
         pair_energies = jnp.where(diag_mask, 0.0, pair_energy_fn(safe_dr))
         return 0.5 * jnp.sum(pair_energies)
+
     return domain_energy
-def domain_energy_from_eam(charge_fn: Callable, embed_fn: Callable, pair_fn: Callable, displacement_fn: Callable, r_cutoff: float) -> Callable:
-    _ = r_cutoff
-    metric = space.metric(displacement_fn)
-    compute_distances = lambda R_local, R_all: jax.vmap(lambda r_i: jax.vmap(lambda r_j: metric(r_i, r_j))(R_all))(R_local)
+
+
+def domain_energy_from_eam(charge_fn: Callable, embed_fn: Callable,
+                           pair_fn: Callable, displacement_fn: Callable) -> Callable:
+    """Builds a dense-distance domain energy for an EAM-form potential.
+
+    Args:
+        charge_fn: Vectorized ``dr -> density``, zero beyond the cutoff.
+        embed_fn: Vectorized ``rho -> embedding energy``.
+        pair_fn: Vectorized ``dr -> pair energy``, zero beyond the cutoff.
+
+    Returns:
+        As ``domain_energy_from_pair``; rho (M,) includes the ``charge_fn(0)`` self term.
+    """
+    compute_distances = lambda R_local, R_all: space.distance(jax.vmap(
+        lambda r_i: jax.vmap(lambda r_j: displacement_fn(r_i, r_j))(R_all))(R_local))
+
     def domain_energy(R_all, local_start, n_local):
         n_all = R_all.shape[0]
         start = lax.convert_element_type(local_start, jnp.int32)
@@ -134,26 +257,66 @@ def domain_energy_from_eam(charge_fn: Callable, embed_fn: Callable, pair_fn: Cal
         pair_matrix = jnp.where(diag_mask, 0.0, pair_fn(safe_dr))
         E_pair = 0.5 * jnp.sum(pair_matrix)
         return E_embed + E_pair
+
     return domain_energy
-def _energy_fn_accepts_n_real_arg(energy_fn: Callable) -> bool:
+
+
+def energy_fn_accepts_n_real_arg(energy_fn: Callable) -> bool:
+    """Detects the optional n_real parameter by name or a **kwargs catch-all; it is passed by keyword.
+
+    A partial with n_real already bound keeps its own value and is reported as not accepting it.
+    """
+    if 'n_real' in (getattr(energy_fn, 'keywords', None) or {}):
+        return False
     try:
-        return len(inspect.signature(energy_fn).parameters) >= 5
+        params = inspect.signature(energy_fn).parameters
     except (TypeError, ValueError):
         return False
-def _validate_symmetric_neighbor_list(neighbor_idx: Array) -> None:
+    return 'n_real' in params or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
+def has_tag(energy_fn: Callable, name: str) -> bool:
+    """True when energy_fn, or a callable it wraps through func or __wrapped__, carries the tag."""
+    seen = set()
+    while energy_fn is not None and id(energy_fn) not in seen:
+        if getattr(energy_fn, name, False):
+            return True
+        seen.add(id(energy_fn))
+        energy_fn = getattr(energy_fn, 'func', None) or getattr(energy_fn, '__wrapped__', None)
+    return False
+
+
+def validate_symmetric_neighbor_list(neighbor_idx: Array, n_atoms: Optional[int] = None) -> None:
+    """Raises ValueError unless a (2, E) list holds (j, i) for every (i, j).
+
+    Negative endpoints are padding, and so are endpoints at or above n_atoms when it is given.
+    """
     idx = jax.device_get(neighbor_idx)
     if idx.ndim != 2 or idx.shape[0] != 2:
         raise ValueError('neighbor_idx must have shape (2, n_pairs) for sparse pair lists.')
     senders = onp.asarray(idx[0], dtype=onp.int64)
     receivers = onp.asarray(idx[1], dtype=onp.int64)
     valid = (senders >= 0) & (receivers >= 0)
+    if n_atoms is not None:
+        valid &= (senders < n_atoms) & (receivers < n_atoms)
     senders = senders[valid]
     receivers = receivers[valid]
     edge_codes = senders << 32 | receivers & 4294967295
     rev_codes = receivers << 32 | senders & 4294967295
     if not onp.array_equal(onp.sort(edge_codes), onp.sort(rev_codes)):
         raise ValueError('Neighbor energies require a symmetric sparse list with both (i, j) and (j, i) edges.')
-def shard_neighbor_idx_by_sender(neighbor_idx: Array, n_domains: int, n_per_domain: int) -> Array:
+
+
+def shard_neighbor_idx_by_sender(neighbor_idx: Array, n_domains: int,
+                                 n_per_domain: int, max_edges_per_domain: Optional[int] = None) -> Array:
+    """Partitions a (2, E) edge list on host by sender domain s // M into (D, 2, E_max), padded with -1.
+
+    Args:
+        max_edges_per_domain: Capacity E_max; default rounds the largest count up to a multiple of 256.
+
+    Raises:
+        ValueError: A domain holds more edges than max_edges_per_domain.
+    """
     idx = onp.asarray(jax.device_get(neighbor_idx))
     if idx.ndim != 2 or idx.shape[0] != 2:
         raise ValueError('neighbor_idx must have shape (2, n_pairs) before sender sharding.')
@@ -169,349 +332,280 @@ def shard_neighbor_idx_by_sender(neighbor_idx: Array, n_domains: int, n_per_doma
         local_edges = idx[:, mask]
         per_domain_edges.append(local_edges)
         max_edges = max(max_edges, local_edges.shape[1])
-    max_edges = max(max_edges, 1)
+    if max_edges_per_domain is None:
+        max_edges = -(-max(max_edges, 1) // 256) * 256
+    elif max_edges > max_edges_per_domain:
+        raise ValueError(f'a domain holds {max_edges} edges, more than max_edges_per_domain {max_edges_per_domain}')
+    else:
+        max_edges = max_edges_per_domain
     sharded = -onp.ones((n_domains, 2, max_edges), dtype=idx.dtype)
     for domain, local_edges in enumerate(per_domain_edges):
         n_edges = local_edges.shape[1]
         if n_edges > 0:
             sharded[domain, :, :n_edges] = local_edges
     return jnp.asarray(sharded)
-def domain_energy_from_pair_with_neighbors(pair_energy_fn: Callable, displacement_fn: Callable) -> Callable:
-    metric = space.metric(displacement_fn)
-    compute_distances = jax.vmap(metric)
+
+
+def domain_energy_from_pair_with_neighbors(pair_energy_fn: Callable,
+                                           displacement_fn: Callable) -> Callable:
+    """Sparse-neighbor variant of ``domain_energy_from_pair`` with the same arguments.
+
+    Distances are ``space.distance`` of the batched displacement; the vmapped jax_md metric
+    miscompiles on the XLA CPU backend in float64 for about 16385 to 40000 edges (jax 0.10.2).
+
+    Returns:
+        ``(R_all (N, 3), neighbor_idx (2, E), local_start, n_local, n_real=None) -> scalar``,
+        0.5 per edge with an owned real sender; negative or >= n_real endpoints are masked.
+    """
+    displacement = jax.vmap(displacement_fn)
+
     def domain_energy(R_all, neighbor_idx, local_start, n_local, n_real=None):
         n_all = R_all.shape[0]
         n_real_i = jnp.asarray(n_all if n_real is None else n_real, dtype=jnp.int32)
         senders, receivers = (neighbor_idx[0], neighbor_idx[1])
-        dr = compute_distances(R_all[senders], R_all[receivers])
-        valid = (senders < n_all) & (receivers < n_all) & (senders < n_real_i) & (receivers < n_real_i) & (senders != receivers)
+        dr = space.distance(displacement(R_all[senders], R_all[receivers]))
+        valid = (senders >= 0) & (receivers >= 0) & (senders < n_all) & (receivers < n_all) \
+            & (senders < n_real_i) & (receivers < n_real_i) & (senders != receivers)
         safe_dr = jnp.where(valid, dr, jnp.ones_like(dr))
         pair_E = pair_energy_fn(safe_dr) * valid.astype(dr.dtype)
-        local_mask = ((senders >= local_start) & (senders < local_start + n_local) & (senders < n_real_i)).astype(dr.dtype)
+        local_mask = ((senders >= local_start) & (senders < local_start + n_local)
+                      & (senders < n_real_i)).astype(dr.dtype)
         return 0.5 * jnp.sum(pair_E * local_mask)
+
+    domain_energy.sender_weighted = True
     return domain_energy
-def domain_energy_from_eam_with_neighbors(charge_fn: Callable, embed_fn: Callable, pair_fn: Callable, displacement_fn: Callable, r_cutoff: float) -> Callable:
-    _ = r_cutoff
-    metric = space.metric(displacement_fn)
-    compute_distances = jax.vmap(metric)
+
+
+def domain_energy_from_eam_with_neighbors(charge_fn: Callable, embed_fn: Callable,
+                                          pair_fn: Callable,
+                                          displacement_fn: Callable) -> Callable:
+    """Sparse-neighbor variant of ``domain_energy_from_eam``, tagged ``requires_replicated_neighbors``.
+
+    Distances as in ``domain_energy_from_pair_with_neighbors``.
+
+    Returns:
+        Same signature as ``domain_energy_from_pair_with_neighbors`` plus embedding on owned
+        real atoms, with rho including the ``charge_fn(0)`` self term.
+    """
+    displacement = jax.vmap(displacement_fn)
+
     def domain_energy(R_all, neighbor_idx, local_start, n_local, n_real=None):
         n_all = R_all.shape[0]
         n_real_i = jnp.asarray(n_all if n_real is None else n_real, dtype=jnp.int32)
         senders, receivers = (neighbor_idx[0], neighbor_idx[1])
-        dr = compute_distances(R_all[senders], R_all[receivers])
-        valid = (senders < n_all) & (receivers < n_all) & (senders < n_real_i) & (receivers < n_real_i) & (senders != receivers)
+        dr = space.distance(displacement(R_all[senders], R_all[receivers]))
+        valid = (senders >= 0) & (receivers >= 0) & (senders < n_all) & (receivers < n_all) \
+            & (senders < n_real_i) & (receivers < n_real_i) & (senders != receivers)
         safe_dr = jnp.where(valid, dr, jnp.ones_like(dr))
         rho_contrib = charge_fn(safe_dr) * valid.astype(dr.dtype)
         rho_neighbors = segment_sum(rho_contrib, receivers, n_all)
         real_atom_mask = (jnp.arange(n_all) < n_real_i).astype(rho_neighbors.dtype)
         rho = rho_neighbors + charge_fn(0.0) * real_atom_mask
         idx = jnp.arange(n_all)
-        local_mask = ((idx >= local_start) & (idx < local_start + n_local) & (idx < n_real_i)).astype(rho_neighbors.dtype)
+        local_mask = ((idx >= local_start) & (idx < local_start + n_local)
+                      & (idx < n_real_i)).astype(rho_neighbors.dtype)
         E_embed = jnp.sum(embed_fn(rho) * local_mask)
         pair_E = pair_fn(safe_dr) * valid.astype(dr.dtype)
-        local_pair_mask = ((senders >= local_start) & (senders < local_start + n_local) & (senders < n_real_i)).astype(dr.dtype)
+        local_pair_mask = ((senders >= local_start) & (senders < local_start + n_local)
+                           & (senders < n_real_i)).astype(dr.dtype)
         E_pair = 0.5 * jnp.sum(pair_E * local_pair_mask)
         return E_embed + E_pair
+
+    domain_energy.requires_replicated_neighbors = True
     return domain_energy
-def make_sharded_energy_with_nbrs(energy_fn: Callable, n_domains: int, n_per_domain: int, mesh: Optional[Mesh]=None, axis_name: str='i', n_real: Optional[int]=None, validate_neighbor_symmetry: bool=True, validate_neighbor_symmetry_once: bool=True, neighbor_sharding: str='replicated') -> Callable:
-    if mesh is None:
-        devices = jax.devices()[:n_domains]
-        mesh = Mesh(devices, axis_names=(axis_name,))
+
+
+def check_neighbor_sharding(energy_fn: Callable, neighbor_sharding: Optional[str]) -> str:
+    """Resolves None from the energy's tag: sender_weighted -> 'sender', requires_replicated_neighbors -> 'replicated'.
+
+    Raises:
+        ValueError: Unknown mode, an untagged energy without an explicit mode, or 'sender' for a
+        receiver-scattering energy.
+    """
+    if neighbor_sharding is None:
+        if has_tag(energy_fn, 'requires_replicated_neighbors'):
+            neighbor_sharding = 'replicated'
+        elif has_tag(energy_fn, 'sender_weighted'):
+            neighbor_sharding = 'sender'
+        else:
+            raise ValueError("neighbor_sharding is required for an untagged energy: 'sender' if it weights "
+                             "edges by owned sender, 'replicated' otherwise.")
     if neighbor_sharding not in ('replicated', 'sender'):
         raise ValueError("neighbor_sharding must be either 'replicated' or 'sender'.")
-    energy_accepts_n_real = _energy_fn_accepts_n_real_arg(energy_fn)
+    if neighbor_sharding == 'sender' and has_tag(energy_fn, 'requires_replicated_neighbors'):
+        raise ValueError("energy_fn scatters over edge receivers and requires neighbor_sharding='replicated'.")
+    return neighbor_sharding
+
+
+
+def make_nbrs_placement(n_domains: int, n_per_domain: int, mesh: Mesh,
+                        axis_name: str, n_real: Optional[int],
+                        validate_neighbor_symmetry: bool,
+                        validate_neighbor_symmetry_once: bool,
+                        neighbor_sharding: str,
+                        max_edges_per_domain: Optional[int] = None,
+                        accepts_n_real: bool = True) -> Callable:
+    """Host-side ``place(R_flat, neighbor_idx, n_real_override)`` shared by the neighbor-list builders.
+
+    Args:
+        max_edges_per_domain: Fixed sender-sharded capacity so rebuilds keep one compiled shape.
+        accepts_n_real: Whether the energy takes n_real; an override for one that does not raises.
+
+    Returns:
+        ``place`` yields R (D, M, 3), nbrs (2, E) or (D, 2, E_max) by sender, n_real int32 scalar.
+        A jax Array neighbor list is placed once and reused while the same object is passed; numpy
+        lists are placed on every call because they may be rewritten in place.
+    """
     sharding = NamedSharding(mesh, P(axis_name))
     replicated_sharding = NamedSharding(mesh, P())
-    validated_once = False
-    @partial(shard_map, mesh=mesh, in_specs=(P(axis_name), P(), P()), out_specs=P(), check_vma=False)
-    def _sharded_energy_replicated(R_local, nbrs_idx, n_real_device):
-        device_idx = lax.axis_index(axis_name)
-        R_all = lax.all_gather(R_local, axis_name=axis_name).reshape(-1, 3)
-        start = device_idx * n_per_domain
-        if energy_accepts_n_real:
-            E_local = energy_fn(R_all, nbrs_idx, start, n_per_domain, n_real_device)
+    state = {'validated': False, 'source': None, 'placed': None}
+
+    def place(R_flat, neighbor_idx, n_real_override):
+        """Places the inputs; a jax Array neighbor list is re-partitioned only when a new one arrives."""
+        if n_real_override is not None and not accepts_n_real:
+            raise ValueError('n_real_override given but energy_fn takes no n_real keyword')
+        if validate_neighbor_symmetry and (not validate_neighbor_symmetry_once or not state['validated']):
+            if neighbor_sharding == 'sender' and neighbor_idx.ndim == 3:
+                if neighbor_idx.shape[0] != n_domains or neighbor_idx.shape[1] != 2:
+                    raise ValueError('Sender-sharded neighbor_idx must have shape (n_domains, 2, max_edges_per_domain).')
+                slab_senders = onp.asarray(jax.device_get(neighbor_idx[:, 0, :]), dtype=onp.int64)
+                real = (slab_senders >= 0) & (slab_senders < n_domains * n_per_domain)
+                if not onp.all((slab_senders // n_per_domain == onp.arange(n_domains)[:, None]) | ~real):
+                    raise ValueError('sender-sharded slab d must hold only edges whose sender lies in '
+                                     'domain d.')
+                validate_symmetric_neighbor_list(jnp.transpose(neighbor_idx, (1, 0, 2)).reshape(2, -1),
+                                                 n_atoms=n_domains * n_per_domain)
+            else:
+                validate_symmetric_neighbor_list(neighbor_idx, n_atoms=n_domains * n_per_domain)
+            state['validated'] = True
+        n_real_value = n_real if n_real is not None else n_real_override
+        if n_real_value is None:
+            n_real_value = n_domains * n_per_domain if R_flat.ndim == 3 else R_flat.shape[0]
+        R_on_mesh = place_on_mesh(R_flat, n_domains, n_per_domain, sharding)
+        n_real_on_mesh = jax.device_put(jnp.asarray(n_real_value, dtype=jnp.int32), replicated_sharding)
+        if state['source'] is neighbor_idx:
+            return (R_on_mesh, state['placed'], n_real_on_mesh)
+        if neighbor_sharding == 'replicated':
+            if neighbor_idx.ndim != 2:
+                raise ValueError('Replicated neighbor_idx must have shape (2, n_pairs).')
+            nbrs_on_mesh = jax.device_put(neighbor_idx, replicated_sharding)
         else:
-            E_local = energy_fn(R_all, nbrs_idx, start, n_per_domain)
-        return lax.psum(E_local, axis_name=axis_name)
-    @partial(shard_map, mesh=mesh, in_specs=(P(axis_name), P(axis_name), P()), out_specs=P(), check_vma=False)
-    def _sharded_energy_sender(R_local, nbrs_idx_local, n_real_device):
-        device_idx = lax.axis_index(axis_name)
+            sharded = neighbor_idx
+            if sharded.ndim == 2:
+                sharded = shard_neighbor_idx_by_sender(sharded, n_domains=n_domains, n_per_domain=n_per_domain,
+                                                      max_edges_per_domain=max_edges_per_domain)
+            elif sharded.ndim != 3:
+                raise ValueError('Sender-sharded neighbor_idx must have shape (n_domains, 2, max_edges_per_domain).')
+            if sharded.shape[0] != n_domains or sharded.shape[1] != 2:
+                raise ValueError('Sender-sharded neighbor_idx must have shape (n_domains, 2, max_edges_per_domain).')
+            nbrs_on_mesh = jax.device_put(sharded, sharding)
+        if isinstance(neighbor_idx, jax.Array):
+            state['source'], state['placed'] = (neighbor_idx, nbrs_on_mesh)
+        return (R_on_mesh, nbrs_on_mesh, n_real_on_mesh)
+
+    return place
+
+
+def make_sharded_energy_with_nbrs(energy_fn: Callable, n_domains: int,
+                                  n_per_domain: int, mesh: Optional[Mesh] = None,
+                                  axis_name: str = 'i', n_real: Optional[int] = None,
+                                  validate_neighbor_symmetry: bool = True,
+                                  validate_neighbor_symmetry_once: bool = True,
+                                  neighbor_sharding: Optional[str] = None,
+                                  max_edges_per_domain: Optional[int] = None) -> Callable:
+    """Replicated-data total energy for neighbor-list domain energies.
+
+    Args:
+        energy_fn: ``(R_all (N, 3), neighbor_idx, local_start, n_local[, n_real]) -> scalar``; tags
+            are read through functools.partial and __wrapped__ chains.
+        mesh: Optional 1-D mesh with n_domains devices, else the first D local devices.
+        n_real: Fixed real-atom count overriding the per-call n_real_override; edges that touch
+            padding atoms in [n_real, D * M) must be symmetric too.
+        validate_neighbor_symmetry: Host-check the (i, j)/(j, i) pairing.
+        validate_neighbor_symmetry_once: Validate only the first call.
+        neighbor_sharding: ``'sender'`` (D, 2, E_max) split by sender, valid only for energies that
+            weight edges by owned sender, or ``'replicated'`` (2, E) on every device; None reads the
+            energy's ``sender_weighted`` or ``requires_replicated_neighbors`` tag.
+        max_edges_per_domain: Fixed E_max for sender sharding so rebuilds do not recompile.
+
+    Returns:
+        ``wrapped(R_flat, neighbor_idx, n_real_override=None) -> scalar``.
+    """
+    if mesh is None:
+        mesh = default_mesh(n_domains, axis_name)
+    check_mesh(mesh, axis_name, n_domains)
+    neighbor_sharding = check_neighbor_sharding(energy_fn, neighbor_sharding)
+    energy_accepts_n_real = energy_fn_accepts_n_real_arg(energy_fn)
+    if n_real is not None and not energy_accepts_n_real:
+        raise ValueError('n_real given but energy_fn takes no n_real keyword')
+
+    def energy_core(R_local, neighbor_idx, n_real_device):
         R_all = lax.all_gather(R_local, axis_name=axis_name).reshape(-1, 3)
-        if nbrs_idx_local.ndim == 3:
-            nbrs_idx_local = jnp.squeeze(nbrs_idx_local, axis=0)
-        start = device_idx * n_per_domain
+        if neighbor_idx.ndim == 3:
+            neighbor_idx = jnp.squeeze(neighbor_idx, axis=0)
+        start = owned_start(axis_name, n_per_domain)
         if energy_accepts_n_real:
-            E_local = energy_fn(R_all, nbrs_idx_local, start, n_per_domain, n_real_device)
+            E_local = energy_fn(R_all, neighbor_idx, start, n_per_domain, n_real=n_real_device)
         else:
-            E_local = energy_fn(R_all, nbrs_idx_local, start, n_per_domain)
+            E_local = energy_fn(R_all, neighbor_idx, start, n_per_domain)
         return lax.psum(E_local, axis_name=axis_name)
+
+    nbrs_spec = P() if neighbor_sharding == 'replicated' else P(axis_name)
+    sharded_energy = jax.jit(shard_map(energy_core, mesh=mesh, in_specs=(P(axis_name), nbrs_spec, P()),
+                                       out_specs=P(), check_vma=False))
+    place = make_nbrs_placement(n_domains, n_per_domain, mesh, axis_name, n_real,
+                                validate_neighbor_symmetry,
+                                validate_neighbor_symmetry_once, neighbor_sharding, max_edges_per_domain,
+                                accepts_n_real=energy_accepts_n_real)
+
     def wrapped_energy(R_flat, neighbor_idx, n_real_override=None):
-        nonlocal validated_once
-        if validate_neighbor_symmetry and (not validate_neighbor_symmetry_once or not validated_once):
-            if neighbor_sharding == 'sender' and neighbor_idx.ndim == 3:
-                if neighbor_idx.shape[0] != n_domains or neighbor_idx.shape[1] != 2:
-                    raise ValueError('Sender-sharded neighbor_idx must have shape (n_domains, 2, max_edges_per_domain).')
-                idx_for_validate = jnp.transpose(neighbor_idx, (1, 0, 2)).reshape(2, -1)
-                _validate_symmetric_neighbor_list(idx_for_validate)
-            else:
-                _validate_symmetric_neighbor_list(neighbor_idx)
-            validated_once = True
-        n_real_value = n_real if n_real is not None else n_real_override
-        if n_real_value is None:
-            n_real_value = R_flat.shape[0]
-        R_on_mesh = _place_on_mesh(R_flat, n_domains, n_per_domain, sharding)
-        n_real_on_mesh = jax.device_put(jnp.asarray(n_real_value, dtype=jnp.int32), replicated_sharding)
-        if neighbor_sharding == 'replicated':
-            if neighbor_idx.ndim != 2:
-                raise ValueError('Replicated neighbor_idx must have shape (2, n_pairs).')
-            nbrs_on_mesh = jax.device_put(neighbor_idx, replicated_sharding)
-            return _sharded_energy_replicated(R_on_mesh, nbrs_on_mesh, n_real_on_mesh)
-        if neighbor_idx.ndim == 2:
-            neighbor_idx = shard_neighbor_idx_by_sender(neighbor_idx, n_domains=n_domains, n_per_domain=n_per_domain)
-        elif neighbor_idx.ndim != 3:
-            raise ValueError('Sender-sharded neighbor_idx must have shape (n_domains, 2, max_edges_per_domain).')
-        if neighbor_idx.shape[0] != n_domains or neighbor_idx.shape[1] != 2:
-            raise ValueError('Sender-sharded neighbor_idx must have shape (n_domains, 2, max_edges_per_domain).')
-        nbrs_on_mesh = jax.device_put(neighbor_idx, sharding)
-        return _sharded_energy_sender(R_on_mesh, nbrs_on_mesh, n_real_on_mesh)
+        return sharded_energy(*place(R_flat, neighbor_idx, n_real_override))
+
     return wrapped_energy
-def make_sharded_force_with_nbrs(energy_fn: Callable, n_domains: int, n_per_domain: int, mesh: Optional[Mesh]=None, axis_name: str='i', n_real: Optional[int]=None, validate_neighbor_symmetry: bool=True, validate_neighbor_symmetry_once: bool=True, neighbor_sharding: str='replicated', use_reduce_scatter: bool=False) -> Callable:
+
+
+def make_sharded_force_with_nbrs(energy_fn: Callable, n_domains: int,
+                                 n_per_domain: int, mesh: Optional[Mesh] = None,
+                                 axis_name: str = 'i', n_real: Optional[int] = None,
+                                 validate_neighbor_symmetry: bool = True,
+                                 validate_neighbor_symmetry_once: bool = True,
+                                 neighbor_sharding: Optional[str] = None,
+                                 use_reduce_scatter: bool = False,
+                                 max_edges_per_domain: Optional[int] = None) -> Callable:
+    """Force counterpart of ``make_sharded_energy_with_nbrs``; ``wrapped`` returns (N, 3) forces.
+
+    Args:
+        use_reduce_scatter: Fold mode as in ``make_sharded_force``.
+    """
     if mesh is None:
-        devices = jax.devices()[:n_domains]
-        mesh = Mesh(devices, axis_names=(axis_name,))
-    if neighbor_sharding not in ('replicated', 'sender'):
-        raise ValueError("neighbor_sharding must be either 'replicated' or 'sender'.")
-    energy_accepts_n_real = _energy_fn_accepts_n_real_arg(energy_fn)
-    sharding = NamedSharding(mesh, P(axis_name))
-    replicated_sharding = NamedSharding(mesh, P())
-    validated_once = False
-    @partial(shard_map, mesh=mesh, in_specs=(P(axis_name), P(), P()), out_specs=P(axis_name), check_vma=False)
-    def _sharded_force_replicated(R_local, nbrs_idx, n_real_device):
-        device_idx = lax.axis_index(axis_name)
+        mesh = default_mesh(n_domains, axis_name)
+    check_mesh(mesh, axis_name, n_domains)
+    neighbor_sharding = check_neighbor_sharding(energy_fn, neighbor_sharding)
+    energy_accepts_n_real = energy_fn_accepts_n_real_arg(energy_fn)
+    if n_real is not None and not energy_accepts_n_real:
+        raise ValueError('n_real given but energy_fn takes no n_real keyword')
+
+    def force_core(R_local, neighbor_idx, n_real_device):
         R_all = lax.all_gather(R_local, axis_name=axis_name).reshape(-1, 3)
-        start = device_idx * n_per_domain
-        index_dtype = jnp.int64 if bool(getattr(jax.config, 'jax_enable_x64', False)) else jnp.int32
-        start = lax.convert_element_type(start, index_dtype)
+        if neighbor_idx.ndim == 3:
+            neighbor_idx = jnp.squeeze(neighbor_idx, axis=0)
+        start = owned_start(axis_name, n_per_domain)
         if energy_accepts_n_real:
-            grad_all = grad(lambda r: energy_fn(r, nbrs_idx, start, n_per_domain, n_real_device))(R_all)
+            grad_all = grad(lambda r: energy_fn(r, neighbor_idx, start, n_per_domain,
+                                                n_real=n_real_device))(R_all)
         else:
-            grad_all = grad(lambda r: energy_fn(r, nbrs_idx, start, n_per_domain))(R_all)
-        if use_reduce_scatter:
-            return -lax.psum_scatter(grad_all, axis_name=axis_name, scatter_dimension=0, tiled=True)
-        grad_total = lax.psum(grad_all, axis_name=axis_name)
-        return -lax.dynamic_slice_in_dim(grad_total, start, n_per_domain, axis=0)
-    @partial(shard_map, mesh=mesh, in_specs=(P(axis_name), P(axis_name), P()), out_specs=P(axis_name), check_vma=False)
-    def _sharded_force_sender(R_local, nbrs_idx_local, n_real_device):
-        device_idx = lax.axis_index(axis_name)
-        R_all = lax.all_gather(R_local, axis_name=axis_name).reshape(-1, 3)
-        if nbrs_idx_local.ndim == 3:
-            nbrs_idx_local = jnp.squeeze(nbrs_idx_local, axis=0)
-        start = device_idx * n_per_domain
-        index_dtype = jnp.int64 if bool(getattr(jax.config, 'jax_enable_x64', False)) else jnp.int32
-        start = lax.convert_element_type(start, index_dtype)
-        if energy_accepts_n_real:
-            grad_all = grad(lambda r: energy_fn(r, nbrs_idx_local, start, n_per_domain, n_real_device))(R_all)
-        else:
-            grad_all = grad(lambda r: energy_fn(r, nbrs_idx_local, start, n_per_domain))(R_all)
-        if use_reduce_scatter:
-            return -lax.psum_scatter(grad_all, axis_name=axis_name, scatter_dimension=0, tiled=True)
-        grad_total = lax.psum(grad_all, axis_name=axis_name)
-        return -lax.dynamic_slice_in_dim(grad_total, start, n_per_domain, axis=0)
+            grad_all = grad(lambda r: energy_fn(r, neighbor_idx, start, n_per_domain))(R_all)
+        return fold_forces(grad_all, start, n_per_domain, axis_name, use_reduce_scatter)
+
+    nbrs_spec = P() if neighbor_sharding == 'replicated' else P(axis_name)
+    sharded_force = jax.jit(shard_map(force_core, mesh=mesh, in_specs=(P(axis_name), nbrs_spec, P()),
+                                      out_specs=P(axis_name), check_vma=False))
+    place = make_nbrs_placement(n_domains, n_per_domain, mesh, axis_name, n_real,
+                                validate_neighbor_symmetry,
+                                validate_neighbor_symmetry_once, neighbor_sharding, max_edges_per_domain,
+                                accepts_n_real=energy_accepts_n_real)
+
     def wrapped_force(R_flat, neighbor_idx, n_real_override=None):
-        nonlocal validated_once
-        if validate_neighbor_symmetry and (not validate_neighbor_symmetry_once or not validated_once):
-            if neighbor_sharding == 'sender' and neighbor_idx.ndim == 3:
-                if neighbor_idx.shape[0] != n_domains or neighbor_idx.shape[1] != 2:
-                    raise ValueError('Sender-sharded neighbor_idx must have shape (n_domains, 2, max_edges_per_domain).')
-                idx_for_validate = jnp.transpose(neighbor_idx, (1, 0, 2)).reshape(2, -1)
-                _validate_symmetric_neighbor_list(idx_for_validate)
-            else:
-                _validate_symmetric_neighbor_list(neighbor_idx)
-            validated_once = True
-        n_real_value = n_real if n_real is not None else n_real_override
-        if n_real_value is None:
-            n_real_value = R_flat.shape[0]
-        R_on_mesh = _place_on_mesh(R_flat, n_domains, n_per_domain, sharding)
-        n_real_on_mesh = jax.device_put(jnp.asarray(n_real_value, dtype=jnp.int32), replicated_sharding)
-        if neighbor_sharding == 'replicated':
-            if neighbor_idx.ndim != 2:
-                raise ValueError('Replicated neighbor_idx must have shape (2, n_pairs).')
-            nbrs_on_mesh = jax.device_put(neighbor_idx, replicated_sharding)
-            return _sharded_force_replicated(R_on_mesh, nbrs_on_mesh, n_real_on_mesh).reshape(-1, 3)
-        if neighbor_idx.ndim == 2:
-            neighbor_idx = shard_neighbor_idx_by_sender(neighbor_idx, n_domains=n_domains, n_per_domain=n_per_domain)
-        elif neighbor_idx.ndim != 3:
-            raise ValueError('Sender-sharded neighbor_idx must have shape (n_domains, 2, max_edges_per_domain).')
-        if neighbor_idx.shape[0] != n_domains or neighbor_idx.shape[1] != 2:
-            raise ValueError('Sender-sharded neighbor_idx must have shape (n_domains, 2, max_edges_per_domain).')
-        nbrs_on_mesh = jax.device_put(neighbor_idx, sharding)
-        return _sharded_force_sender(R_on_mesh, nbrs_on_mesh, n_real_on_mesh).reshape(-1, 3)
+        return sharded_force(*place(R_flat, neighbor_idx, n_real_override)).reshape(-1, 3)
+
     return wrapped_force
-def _expand_neighborhood(senders, receivers, owned_start, owned_count, n_layers, n_atoms, n_edges):
-    atom_idx = jnp.arange(n_atoms)
-    in_set = (atom_idx >= owned_start) & (atom_idx < owned_start + owned_count)
-    valid_edge = (senders < n_atoms) & (receivers < n_atoms)
-    def expand_one_hop(carry, _):
-        in_set_ = carry
-        sender_in = jnp.take(in_set_, senders, fill_value=False) & valid_edge
-        receiver_in = jnp.take(in_set_, receivers, fill_value=False) & valid_edge
-        newly_reached = jnp.zeros(n_atoms, dtype=jnp.bool_)
-        newly_reached = newly_reached.at[receivers].max(sender_in)
-        newly_reached = newly_reached.at[senders].max(receiver_in)
-        return (in_set_ | newly_reached, None)
-    in_set, _ = lax.scan(expand_one_hop, in_set, None, length=n_layers)
-    return in_set
-def _extract_subgraph(R_all, species_all, senders, receivers, edge_features, atom_mask, max_atoms, max_edges):
-    n_atoms = R_all.shape[0]
-    n_edges = senders.shape[0]
-    global_to_local = jnp.cumsum(atom_mask.astype(jnp.int32)) - 1
-    global_to_local = jnp.where(atom_mask, global_to_local, max_atoms)
-    n_sub = jnp.sum(atom_mask.astype(jnp.int32))
-    atom_indices = jnp.where(atom_mask, jnp.arange(n_atoms), n_atoms)
-    sorted_idx = jnp.argsort(~atom_mask)
-    selected = sorted_idx[:max_atoms]
-    selected = jnp.where(jnp.arange(max_atoms) < n_sub, selected, 0)
-    R_sub = R_all[selected]
-    R_sub = jnp.where((jnp.arange(max_atoms) < n_sub)[:, None], R_sub, jnp.zeros(3))
-    species_sub = species_all[selected]
-    species_sub = jnp.where(jnp.arange(max_atoms) < n_sub, species_sub, 0)
-    sender_in = jnp.take(atom_mask, senders, fill_value=False)
-    receiver_in = jnp.take(atom_mask, receivers, fill_value=False)
-    edge_valid = sender_in & receiver_in & (senders < n_atoms) & (receivers < n_atoms)
-    local_senders = jnp.take(global_to_local, senders, fill_value=max_atoms)
-    local_receivers = jnp.take(global_to_local, receivers, fill_value=max_atoms)
-    edge_order = jnp.argsort(~edge_valid)
-    n_valid_edges = jnp.sum(edge_valid.astype(jnp.int32))
-    sel_edges = edge_order[:max_edges]
-    sel_valid = jnp.arange(max_edges) < n_valid_edges
-    senders_sub = jnp.where(sel_valid, local_senders[sel_edges], max_atoms)
-    receivers_sub = jnp.where(sel_valid, local_receivers[sel_edges], max_atoms)
-    edges_sub = jnp.where(sel_valid[:, None], edge_features[sel_edges], jnp.ones(edge_features.shape[1]))
-    return (R_sub, species_sub, senders_sub, receivers_sub, edges_sub, n_sub, global_to_local)
-def _expand_neighborhood_host(senders, receivers, owned_start, owned_count, n_layers, n_atoms):
-    in_set = onp.zeros(n_atoms, dtype=bool)
-    in_set[owned_start:owned_start + owned_count] = True
-    valid = (senders < n_atoms) & (receivers < n_atoms)
-    s_valid = senders[valid]
-    r_valid = receivers[valid]
-    for _ in range(n_layers):
-        sender_in = in_set[s_valid]
-        receiver_in = in_set[r_valid]
-        new_atoms = onp.zeros(n_atoms, dtype=bool)
-        onp.maximum.at(new_atoms, r_valid, sender_in)
-        onp.maximum.at(new_atoms, s_valid, receiver_in)
-        in_set |= new_atoms
-    return in_set
-def _extract_subgraph_host(R_all, species_all, senders, receivers, shifts, atom_mask, max_atoms, max_edges):
-    n_atoms = R_all.shape[0]
-    dim = shifts.shape[1] if shifts.ndim == 2 else 3
-    selected_global = onp.where(atom_mask)[0]
-    n_sub = len(selected_global)
-    g2l = onp.full(n_atoms, max_atoms, dtype=onp.int32)
-    g2l[selected_global] = onp.arange(n_sub, dtype=onp.int32)
-    pad_atoms = max_atoms - n_sub
-    if pad_atoms > 0:
-        selected_padded = onp.concatenate([selected_global, onp.zeros(pad_atoms, dtype=onp.int64)])
-    else:
-        selected_padded = selected_global[:max_atoms]
-    R_np = onp.asarray(R_all)
-    R_sub = R_np[selected_padded].copy()
-    R_sub[n_sub:] = 0.0
-    sp_np = onp.asarray(species_all)
-    sp_sub = sp_np[selected_padded].copy()
-    sp_sub[n_sub:] = 0
-    s_clipped = onp.clip(senders, 0, n_atoms - 1)
-    r_clipped = onp.clip(receivers, 0, n_atoms - 1)
-    s_in = atom_mask[s_clipped] & (senders < n_atoms)
-    r_in = atom_mask[r_clipped] & (receivers < n_atoms)
-    edge_valid = s_in & r_in
-    valid_indices = onp.where(edge_valid)[0]
-    n_valid = len(valid_indices)
-    if n_valid > max_edges:
-        valid_indices = valid_indices[:max_edges]
-        n_valid = max_edges
-    pad_edges = max_edges - n_valid
-    if pad_edges > 0:
-        sel_edges = onp.concatenate([valid_indices, onp.zeros(pad_edges, dtype=onp.int64)])
-    else:
-        sel_edges = valid_indices
-    arange_e = onp.arange(max_edges)
-    valid_mask = arange_e < n_valid
-    s_sub = onp.where(valid_mask, g2l[senders[sel_edges]], max_atoms)
-    r_sub = onp.where(valid_mask, g2l[receivers[sel_edges]], max_atoms)
-    shifts_np = onp.asarray(shifts)
-    shifts_sub = onp.where(valid_mask[:, None], shifts_np[sel_edges], 0)
-    return (jnp.asarray(R_sub), jnp.asarray(sp_sub), jnp.asarray(s_sub, dtype=jnp.int32), jnp.asarray(r_sub, dtype=jnp.int32), jnp.asarray(shifts_sub), n_sub, jnp.asarray(g2l, dtype=jnp.int32), jnp.asarray(selected_padded, dtype=jnp.int32))
-def make_sharded_gnn_force(model_fn: Callable, species: Array, n_layers: int, config: DomainConfig, box: Array, max_atoms: Optional[int]=None, max_edges: Optional[int]=None, use_reduce_scatter: bool=True) -> Callable:
-    mesh = config.mesh
-    axis_name = config.axis_name
-    n_domains = config.n_domains
-    n_per_domain = config.n_atoms_per_domain
-    n_atoms = n_domains * n_per_domain
-    box_matrix = jnp.asarray(box)
-    sharding = NamedSharding(mesh, P(axis_name))
-    _max_atoms: int = n_atoms if max_atoms is None else max_atoms
-    _max_edges: int = n_atoms * 200 if max_edges is None else max_edges
-    def _squeeze(x):
-        if x.ndim >= 2 and x.shape[0] == 1:
-            return jnp.squeeze(x, axis=0)
-        return x
-    @partial(shard_map, mesh=mesh, in_specs=(P(axis_name), P(axis_name), P(axis_name), P(axis_name), P(axis_name), P(axis_name), P(axis_name)), out_specs=(P(), P(axis_name)), check_vma=False)
-    def _sharded_ef(R_local, sp_sub_pad, s_sub, r_sub, shifts_sub, g2l_local, selected_global):
-        device_idx = lax.axis_index(axis_name)
-        R_all = lax.all_gather(R_local, axis_name=axis_name).reshape(-1, 3)
-        start = device_idx * n_per_domain
-        sp_sub_pad = _squeeze(sp_sub_pad)
-        s_sub = _squeeze(s_sub)
-        r_sub = _squeeze(r_sub)
-        shifts_sub = _squeeze(shifts_sub)
-        g2l_local = _squeeze(g2l_local)
-        selected_global = _squeeze(selected_global)
-        local_start = g2l_local[start]
-        def local_energy(r_all_):
-            r_sub_ = r_all_[selected_global]
-            pos_real = space.transform(box_matrix, r_sub_)
-            shifts_real = space.transform(box_matrix, shifts_sub)
-            pos_real_pad = jnp.concatenate([pos_real, jnp.zeros((1, 3))])
-            displacements = pos_real_pad[r_sub] - pos_real_pad[s_sub] - shifts_real
-            edge_valid = (s_sub < _max_atoms) & (r_sub < _max_atoms)
-            displacements = jnp.where(edge_valid[:, None], displacements, 1.0)
-            ne = model_fn(displacements, sp_sub_pad, s_sub, r_sub)
-            owned = lax.dynamic_slice_in_dim(ne[:_max_atoms], local_start, n_per_domain, axis=0)
-            return jnp.sum(owned)
-        E_local, grad_all = jax.value_and_grad(local_energy)(R_all)
-        E_total = lax.psum(E_local, axis_name=axis_name)
-        if use_reduce_scatter:
-            F_local = -lax.psum_scatter(grad_all, axis_name=axis_name, scatter_dimension=0, tiled=True)
-        else:
-            grad_total = lax.psum(grad_all, axis_name=axis_name)
-            F_local = -lax.dynamic_slice_in_dim(grad_total, start, n_per_domain, axis=0)
-        return (E_total, F_local)
-    def wrapped(R_flat, neighbor):
-        R_all_np = onp.asarray(jax.device_get(R_flat))
-        species_np = onp.asarray(jax.device_get(species))
-        receivers_np, senders_np = (onp.asarray(jax.device_get(neighbor.idx[0])), onp.asarray(jax.device_get(neighbor.idx[1])))
-        shifts_np = onp.asarray(jax.device_get(neighbor.shifts))
-        per_domain_data = []
-        for d in range(n_domains):
-            start = d * n_per_domain
-            atom_mask = _expand_neighborhood_host(senders_np, receivers_np, start, n_per_domain, n_layers, n_atoms)
-            _, sp_sub, s_sub, r_sub, shifts_sub, n_sub, g2l, sel_padded = _extract_subgraph_host(R_all_np, species_np, senders_np, receivers_np, shifts_np, atom_mask, _max_atoms, _max_edges)
-            sp_sub_pad = jnp.concatenate([sp_sub, jnp.zeros(1, dtype=sp_sub.dtype)])
-            per_domain_data.append((sp_sub_pad, s_sub, r_sub, shifts_sub, g2l, sel_padded))
-        sp_all = jnp.stack([d[0] for d in per_domain_data])
-        s_all = jnp.stack([d[1] for d in per_domain_data])
-        r_all = jnp.stack([d[2] for d in per_domain_data])
-        sh_all = jnp.stack([d[3] for d in per_domain_data])
-        g2l_all = jnp.stack([d[4] for d in per_domain_data])
-        sel_all = jnp.stack([d[5] for d in per_domain_data])
-        R_on_mesh = jax.device_put(R_flat.reshape(n_domains, n_per_domain, 3), sharding)
-        sp_mesh = jax.device_put(sp_all, sharding)
-        s_mesh = jax.device_put(s_all, sharding)
-        r_mesh = jax.device_put(r_all, sharding)
-        sh_mesh = jax.device_put(sh_all, sharding)
-        g2l_mesh = jax.device_put(g2l_all, sharding)
-        sel_mesh = jax.device_put(sel_all, sharding)
-        E, F = _sharded_ef(R_on_mesh, sp_mesh, s_mesh, r_mesh, sh_mesh, g2l_mesh, sel_mesh)
-        return (E, F.reshape(-1, 3))
-    return wrapped
