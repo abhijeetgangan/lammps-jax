@@ -148,8 +148,20 @@ def export_eam(args, max_edges, parser):
     force_fn = None
     if args.setfl is not None and args.funcfl is not None:
         parser.error("--setfl and --funcfl are mutually exclusive")
-    if args.force_output == "edge" and args.setfl is None and args.funcfl is None:
+    analytic = args.setfl is None and args.funcfl is None
+    # EAM's energy is local to one cutoff, so one hop is exact; only the analytic
+    # pair-embedding cross term reaches two cutoffs and needs a second hop.
+    n_hops = 2 if analytic and args.pair_embedding != 0.0 and not communicating else 1
+    if args.half_edges and not communicating:
+        parser.error("--half-edges needs --mode comm: the plugin accepts half-edge "
+                     "bundles only with a communication schedule or a multi-hop "
+                     "shell, and EAM exports one hop")
+    if args.force_output == "edge" and analytic:
         parser.error("--force-output edge requires a tabulated potential")
+    if args.force_output == "edge" and not (communicating and args.half_edges):
+        parser.error("--force-output edge needs --mode comm --half-edges: newton-on "
+                     "edge forces use a half list, and ghost densities complete "
+                     "only through the exchange")
     if args.setfl is not None or args.funcfl is not None:
         table_path = args.setfl if args.setfl is not None else args.funcfl
         tables = load_setfl(args.setfl) if args.setfl else load_funcfl(args.funcfl)
@@ -186,10 +198,9 @@ def export_eam(args, max_edges, parser):
         unit_style=unit_style,
         precision=args.precision,
         force_output="edge-force" if force_fn is not None else "atom-force",
-        newton=("on" if force_fn is not None or (communicating and args.half_edges)
-                else "any"),
+        newton="on",
         comm=communicating,
-        n_hops=1 if communicating else 2,
+        n_hops=n_hops,
         half_edges=args.half_edges,
         n_species=n_species,
     )
@@ -226,7 +237,8 @@ def main() -> None:
     eam.add_argument(
         "--force-output", choices=("atom", "edge"), default="atom",
         help="atom: forces by autodiff of the summed energy; edge: per-edge "
-             "pair forces with the density exchanged in the model, newton on.",
+             "pair forces with the density exchanged in the model, needs "
+             "--mode comm --half-edges.",
     )
     eam.add_argument(
         "--cutoff", type=float, default=1.6,
@@ -254,14 +266,15 @@ def main() -> None:
     )
     eam.add_argument(
         "--mode", choices=("ghost", "comm"), default="ghost",
-        help="ghost: extended ghost shell, no in-program exchange. "
-             "comm: one-cutoff shell with a density exchange, mirroring "
-             "native pair_eam.",
+        help="ghost: one-cutoff shell, no in-program exchange (two cutoffs "
+             "only for the analytic model with --pair-embedding). comm: "
+             "one-cutoff shell with a density exchange, mirroring native "
+             "pair_eam.",
     )
     eam.add_argument(
         "--half-edges", action="store_true",
         help="Pack each pair once instead of both directions; size "
-             "--edges-per-atom for the deduplicated count. With --mode comm, "
+             "--edges-per-atom for the deduplicated count. Needs --mode comm: "
              "boundary pairs pack on one rank and densities reverse-communicate.",
     )
 
