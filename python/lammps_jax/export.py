@@ -1,7 +1,8 @@
 """Export JAX energy or force callables as fixed-capacity VHLO bundles for pair_style jax/kk.
 
-Padding edges carry senders = receivers = max_atoms with edge_mask false;
-where-substitute masked indices and guard divisions or the gradient goes NaN.
+Padding edges carry senders = receivers = max_atoms with edge_mask false. Gather
+with mode="fill" and scatter with mode="drop" so padding reads zeros and is dropped
+instead of piling onto row 0, and guard divisions or the gradient goes NaN.
 """
 
 import base64
@@ -228,8 +229,6 @@ def export_model(
         raise ValueError("newton must be 'on', 'off', or 'any'")
     if precision not in PRECISIONS:
         raise ValueError(f"precision must be one of {list(PRECISIONS)}")
-    if comm and precision == "float64":
-        raise ValueError("communicating exports are float32-only")
     if n_species is not None and n_species < 1:
         raise ValueError("n_species must be positive when given")
     if precision == "float64" and not jax.config.jax_enable_x64:  # ty: ignore[unresolved-attribute]
@@ -376,7 +375,7 @@ def export_model(
     ) -> tuple[Any, LammpsNeighborList, Any, Any]:
         if comm:
             # Fresh per trace: token and width record are trace-local.
-            comm_obj = Comm(enabled=True, expected_widths=comm_widths)
+            comm_obj = Comm(enabled=True, expected_widths=comm_widths, dtype=dtype)
             return call_model_with(model_fn, model_args, comm_obj)
         return call_model_with(model_fn, model_args)
 
@@ -416,7 +415,7 @@ def export_model(
 
     exchange_width = re.compile(
         r"custom_call @lammps_jax\.(?:forward|reverse)_comm\(.*?"
-        r"tensor<\d+x(\d+)xf32>"
+        r"tensor<\d+x(\d+)xf(?:32|64)>"
     )
 
     def check_exchange_widths(exported: Any) -> None:

@@ -288,11 +288,6 @@ ModelBundle load_bundle_file(const std::string &path)
     throw std::runtime_error(
         "Communicating edge-force bundles require half-edge packing; full "
         "pairing packs both directions and the newton scatter doubles forces");
-  if (!bundle.contract.comm_widths.empty() && bundle.contract.precision == Precision::Float64)
-    throw std::runtime_error(
-        "float64 communicating bundles are not supported: the in-program feature "
-        "exchange path is float32-only. Re-export the model with precision float32 "
-        "or without in-program communication");
   return bundle;
 }
 

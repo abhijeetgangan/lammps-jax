@@ -68,6 +68,10 @@ EXPORTS = {
     "eam_comm": ("export_model.py",
                  ("eam", "{output}", "--max-atoms", "4096", "--edges-per-atom", "64",
                   "--mode", "comm", "--pair-embedding", str(EAM_PAIR_EMBED))),
+    "eam_comm_f64": ("export_model.py",
+                     ("eam", "{output}", "--max-atoms", "4096", "--edges-per-atom", "64",
+                      "--mode", "comm", "--pair-embedding", str(EAM_PAIR_EMBED),
+                      "--precision", "float64")),
     "eam_ghostx": ("export_model.py",
                 ("eam", "{output}", "--max-atoms", "4096", "--edges-per-atom", "64",
                  "--pair-embedding", str(EAM_PAIR_EMBED))),
@@ -106,6 +110,11 @@ EXPORTS = {
                    "examples/potentials/CuZr.eam.alloy.gz",
                    "--max-atoms", "3072", "--edges-per-atom", "32",
                    "--half-edges", "--mode", "comm")),
+    "cuzr_uniq_f64": ("export_model.py",
+                      ("eam", "{output}", "--setfl",
+                       "examples/potentials/CuZr.eam.alloy.gz",
+                       "--max-atoms", "3072", "--edges-per-atom", "32",
+                       "--half-edges", "--mode", "comm", "--precision", "float64")),
 }
 
 DECKS = {
@@ -323,6 +332,9 @@ CASES = {
     "eam_comm_static": dict(
         kind="static", deck="eam_static", bundle="eam_comm", newton="on",
         pressure=True, dense="eam_embedded"),
+    "eam_comm_f64_static": dict(
+        kind="static", deck="eam_static", bundle="eam_comm_f64", newton="on",
+        pressure=True, float64=True, dense="eam_embedded"),
     "eam_ghostx_static": dict(
         kind="static", deck="eam_static", bundle="eam_ghostx", newton="on",
         pressure=True, dense="eam_embedded"),
@@ -340,6 +352,11 @@ CASES = {
     "cuzr_uniq_static": dict(
         kind="static", deck="cuzr_static", bundle="cuzr_uniq", newton="on",
         pressure=True, dense="cuzr", pressure_tol=1.0e-2),
+    # f64 reverse comm of density partials; same tolerances as the ghost-scheme cuzr_static.
+    "cuzr_uniq_f64_static": dict(
+        kind="static", deck="cuzr_static", bundle="cuzr_uniq_f64", newton="on",
+        pressure=True, float64=True, dense="cuzr",
+        energy_tol=1.0e-12, pressure_tol=1.0e-8),
     "eam_nve": dict(kind="nve", deck="eam_nve", bundle="eam", dense="eam"),
     "mace_comm_nve": dict(kind="nve", deck="mace_nve", bundle="mace_comm",
                           pressure_tol=5.0e-2),
@@ -929,8 +946,9 @@ def test_nve_trajectory(runner, case):
 @pytest.mark.parametrize(
     "case_a, case_b",
     [("eam_comm_static", "eam_ghostx_static"),
-     ("eam_comm_half_static", "eam_comm_static")],
-    ids=["eam", "eam-comm-pairing"],
+     ("eam_comm_half_static", "eam_comm_static"),
+     ("eam_comm_f64_static", "eam_comm_static")],
+    ids=["eam", "eam-comm-pairing", "eam-comm-precision"],
 )
 def test_scheme_cross_agreement(runner, case_a, case_b):
     """Same weights and coordinates under two schemes or edge packings.

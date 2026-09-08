@@ -12,6 +12,7 @@ import jax.numpy as jnp
 import numpy as np
 
 
+
 def read_table_lines(path: str) -> list[str]:
     opener = gzip.open if str(path).endswith(".gz") else open
     with opener(path, "rt") as handle:
@@ -43,9 +44,9 @@ def make_eam_energy(
         dtype = positions.dtype
         cutoff_sq = jnp.asarray(cutoff * cutoff, dtype)
         zero = jnp.asarray(0.0, dtype)
-        safe_senders = jnp.where(graph.edge_mask, graph.senders, 0)
-        safe_receivers = jnp.where(graph.edge_mask, graph.receivers, 0)
-        rij = positions[safe_receivers] - positions[safe_senders]
+        senders, receivers = graph.senders, graph.receivers
+        rij = (positions.at[receivers].get(mode="fill", fill_value=0)
+               - positions.at[senders].get(mode="fill", fill_value=0))
         r_sq = jnp.sum(rij * rij, axis=-1)
         valid = graph.edge_mask & (r_sq < cutoff_sq)
         envelope = jnp.where(valid, (1.0 - r_sq / cutoff_sq) ** 2, zero)
@@ -57,15 +58,14 @@ def make_eam_energy(
         density_term = jnp.asarray(dens_f0, dtype) * envelope
         if unique_boundary:
             # One rank packs each pair; the owned sender carries the full phi.
-            pair_energy = zeros.at[safe_senders].add(2.0 * pair_term)
+            pair_energy = zeros.at[senders].add(2.0 * pair_term, mode="drop")
         else:
-            pair_energy = zeros.at[safe_senders].add(pair_term)
+            pair_energy = zeros.at[senders].add(pair_term, mode="drop")
             if half_edges:
-                pair_energy = pair_energy.at[safe_receivers].add(pair_term)
-        density = zeros.at[safe_senders].add(density_term)
+                pair_energy = pair_energy.at[receivers].add(pair_term, mode="drop")
+        density = zeros.at[senders].add(density_term, mode="drop")
         if half_edges:
-            density = density.at[safe_receivers].add(density_term)
-
+            density = density.at[receivers].add(density_term, mode="drop")
         eps = jnp.asarray(embed_eps, dtype)
 
         def embed(rho):
@@ -84,17 +84,19 @@ def make_eam_energy(
         energy = pair_energy + embed(density)
         if pair_embedding != 0.0:
             kappa = jnp.asarray(pair_embedding, dtype)
+            embedded = embed(density)
+            at_receivers = embedded.at[receivers].get(mode="fill", fill_value=0)
             if unique_boundary:
-                cross = kappa * envelope * (
-                    embed(density)[safe_receivers] + embed(density)[safe_senders]
-                )
-                energy = energy + zeros.at[safe_senders].add(cross)
+                at_senders = embedded.at[senders].get(mode="fill", fill_value=0)
+                cross = kappa * envelope * (at_receivers + at_senders)
+                energy = energy + zeros.at[senders].add(cross, mode="drop")
             else:
-                cross = kappa * envelope * embed(density)[safe_receivers]
-                energy = energy + zeros.at[safe_senders].add(cross)
+                cross = kappa * envelope * at_receivers
+                energy = energy + zeros.at[senders].add(cross, mode="drop")
                 if half_edges:
-                    reverse = kappa * envelope * embed(density)[safe_senders]
-                    energy = energy + zeros.at[safe_receivers].add(reverse)
+                    at_senders = embedded.at[senders].get(mode="fill", fill_value=0)
+                    reverse = kappa * envelope * at_senders
+                    energy = energy + zeros.at[receivers].add(reverse, mode="drop")
         return energy
 
     if communicating:
@@ -273,35 +275,34 @@ def make_setfl_energy(tables: dict, *, communicating: bool = False,
         zero = jnp.asarray(0.0, dtype)
         one = jnp.asarray(1.0, dtype)
 
-        safe_senders = jnp.where(graph.edge_mask, graph.senders, 0)
-        safe_receivers = jnp.where(graph.edge_mask, graph.receivers, 0)
-        rij = positions[safe_receivers] - positions[safe_senders]
+        senders, receivers = graph.senders, graph.receivers
+        rij = (positions.at[receivers].get(mode="fill", fill_value=0)
+               - positions.at[senders].get(mode="fill", fill_value=0))
         r_sq = jnp.sum(rij * rij, axis=-1)
         valid = graph.edge_mask & (r_sq < cutoff_sq)
         # Nonzero fallback keeps sqrt and the phi division autodiff-safe.
         r = jnp.sqrt(jnp.where(valid, r_sq, one))
-        sender_species = species[safe_senders]
-        receiver_species = species[safe_receivers]
+        sender_species = species.at[senders].get(mode="fill", fill_value=0)
+        receiver_species = species.at[receivers].get(mode="fill", fill_value=0)
 
         n_atoms = positions.shape[0]
         zeros = jnp.zeros((n_atoms,), dtype=dtype)
         rho_edge = spline_lookup(density_tables, receiver_species, r, tables["dr"])
-        density = zeros.at[safe_senders].add(jnp.where(valid, rho_edge, zero))
+        density = zeros.at[senders].add(jnp.where(valid, rho_edge, zero), mode="drop")
         z2 = spline_lookup(pair_tables, pair_index[sender_species, receiver_species],
                            r, tables["dr"])
         pair_term = jnp.where(valid, 0.5 * z2 / r, zero)
         if unique_boundary:
             # One rank packs each pair; the owned sender carries the full phi.
-            pair_energy = zeros.at[safe_senders].add(2.0 * pair_term)
+            pair_energy = zeros.at[senders].add(2.0 * pair_term, mode="drop")
         else:
-            pair_energy = zeros.at[safe_senders].add(pair_term)
+            pair_energy = zeros.at[senders].add(pair_term, mode="drop")
             if half_edges:
-                pair_energy = pair_energy.at[safe_receivers].add(pair_term)
+                pair_energy = pair_energy.at[receivers].add(pair_term, mode="drop")
         if half_edges:
             # The reverse direction reads the other endpoint's element.
             rho_reverse = spline_lookup(density_tables, sender_species, r, tables["dr"])
-            density = density.at[safe_receivers].add(jnp.where(valid, rho_reverse, zero))
-
+            density = density.at[receivers].add(jnp.where(valid, rho_reverse, zero), mode="drop")
         if comm is not None:
             density = (comm.reverse_comm(density) if unique_boundary
                        else comm.forward_comm(density))
@@ -344,22 +345,22 @@ def make_setfl_edge_force(tables: dict, *, communicating: bool = False,
         zero = jnp.asarray(0.0, dtype)
         one = jnp.asarray(1.0, dtype)
 
-        safe_senders = jnp.where(graph.edge_mask, graph.senders, 0)
-        safe_receivers = jnp.where(graph.edge_mask, graph.receivers, 0)
-        rij = positions[safe_receivers] - positions[safe_senders]
+        senders, receivers = graph.senders, graph.receivers
+        rij = (positions.at[receivers].get(mode="fill", fill_value=0)
+               - positions.at[senders].get(mode="fill", fill_value=0))
         r_sq = jnp.sum(rij * rij, axis=-1)
         valid = graph.edge_mask & (r_sq < cutoff_sq)
         r = jnp.sqrt(jnp.where(valid, r_sq, one))
-        sender_species = species[safe_senders]
-        receiver_species = species[safe_receivers]
+        sender_species = species.at[senders].get(mode="fill", fill_value=0)
+        receiver_species = species.at[receivers].get(mode="fill", fill_value=0)
 
         n_atoms = positions.shape[0]
         zeros = jnp.zeros((n_atoms,), dtype=dtype)
         rho_edge = spline_lookup(density_tables, receiver_species, r, tables["dr"])
-        density = zeros.at[safe_senders].add(jnp.where(valid, rho_edge, zero))
+        density = zeros.at[senders].add(jnp.where(valid, rho_edge, zero), mode="drop")
         if half_edges:
             rho_reverse = spline_lookup(density_tables, sender_species, r, tables["dr"])
-            density = density.at[safe_receivers].add(jnp.where(valid, rho_reverse, zero))
+            density = density.at[receivers].add(jnp.where(valid, rho_reverse, zero), mode="drop")
         if comm is not None:
             if unique_boundary:
                 # Owners complete on reverse; ghost fp needs the forward.
@@ -379,7 +380,9 @@ def make_setfl_edge_force(tables: dict, *, communicating: bool = False,
         z2p = spline_lookup(pair_tables, pair_ids, r, tables["dr"], derivative=True)
         phi = z2 / r
         phip = (z2p - phi) / r
-        psip = fp[safe_senders] * rhojp + fp[safe_receivers] * rhoip + phip
+        fp_i = fp.at[senders].get(mode="fill", fill_value=0)
+        fp_j = fp.at[receivers].get(mode="fill", fill_value=0)
+        psip = fp_i * rhojp + fp_j * rhoip + phip
         scale = jnp.where(valid, psip / r, zero)
         return scale[:, None] * rij
 

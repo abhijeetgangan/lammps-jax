@@ -21,7 +21,7 @@ enum class NewtonMode {
   Off,
 };
 
-// Width of positions, box, energy, forces; index inputs stay integer. Comm bundles are f32-only.
+// Width of positions, box, energy, forces, and exchanged comm features; index inputs stay integer.
 enum class Precision {
   Float32,
   Float64,

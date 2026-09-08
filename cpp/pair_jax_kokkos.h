@@ -62,7 +62,21 @@ class PairJaxKokkos : public Pair, public KokkosBase {
   bool edge_force_enabled() const;
   bool comm_enabled() const;
   bool f64_enabled() const;
+  // Calls f with a float or double value per the contract precision; f deduces Scalar from it.
+  template <typename F>
+  auto dispatch_by_precision(F &&f)
+  {
+    if (f64_enabled()) return f(double{});
+    return f(float{});
+  }
   void service_model_comm(const pjrt::ModelCommRequest &request);
+  // Comm rows hold contract-precision features that LAMMPS moves as opaque doubles.
+  size_t comm_elem_bytes() const { return f64_enabled() ? sizeof(double) : sizeof(float); }
+  int comm_slots(int width) const
+  {
+    return static_cast<int>((width * comm_elem_bytes() + sizeof(double) - 1) / sizeof(double));
+  }
+  int comm_words() const { return comm_width * static_cast<int>(comm_elem_bytes() / 4); }
 
   AtomKokkos *atomKK = nullptr;
   // Empty means: resolve via LAMMPS_JAX_PJRT_PLUGIN_PATH, then the soname.
@@ -75,8 +89,8 @@ class PairJaxKokkos : public Pair, public KokkosBase {
   // The packed edge graph persists between reneighbor steps; cached count is the launch extent.
   int cached_edge_count = 0;
   // Active model-comm site state, valid only inside service_model_comm.
-  float *comm_rows = nullptr;
-  float *d_comm_rows = nullptr;
+  void *comm_rows = nullptr;
+  void *d_comm_rows = nullptr;
   int comm_width = 0;
 
 #ifdef KOKKOS_ENABLE_CUDA
@@ -129,13 +143,6 @@ class PairJaxKokkos : public Pair, public KokkosBase {
       return staging64;
     else
       return staging32;
-  }
-  // Calls f with a float or double value per the contract precision; f deduces Scalar from it.
-  template <typename F>
-  auto dispatch_by_precision(F &&f)
-  {
-    if (f64_enabled()) return f(double{});
-    return f(float{});
   }
   int_view d_species;
   scalar_int_view d_nlocal;

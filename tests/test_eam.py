@@ -2,6 +2,7 @@
 
 import contextlib
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -24,12 +25,14 @@ from lammps_jax.eam import (
     load_funcfl,
     load_setfl,
     make_eam_energy,
+    make_setfl_edge_force,
     make_setfl_energy,
     spline_coefficients,
     spline_lookup,
 )
 from lammps_jax.export import (
     DISTRIBUTED_BUNDLE_FORMAT,
+    HALF_EDGE_BUNDLE_FORMAT,
     LammpsNeighborList,
     program_text,
     wrap_energy_fn,
@@ -522,7 +525,109 @@ def test_export_eam_bundle(tmp_path):
     assert "func.func public @main" in program_text(data, "energy_and_forces_mlir")
 
 
+EXCHANGE_OPERAND = re.compile(
+    r"custom_call @lammps_jax\.(?:forward|reverse)_comm\(.*?tensor<\d+x\d+x(f32|f64)>")
+
+
+def test_export_eam_comm_half_edge_float64(tmp_path):
+    """A float64 communicating bundle exchanges density rows as f64."""
+    with jax.enable_x64(True):
+        data = export_and_load(
+            tmp_path / "eam_comm_f64.json",
+            energy_fn=make_eam_energy(cutoff=1.6, communicating=True, half_edges=True,
+                                      **PARAMS),
+            max_atoms=8,
+            max_edges=16,
+            cutoff=1.6,
+            unit_style="lj",
+            newton="on",
+            comm=True,
+            half_edges=True,
+            precision="float64",
+        )
+    assert data["format"] == HALF_EDGE_BUNDLE_FORMAT
+    assert data["contract"]["precision"] == "float64"
+    assert data["contract"]["comm_widths"] == [1]
+    for program in ("force_mlir", "energy_mlir", "energy_and_forces_mlir"):
+        operand_types = EXCHANGE_OPERAND.findall(program_text(data, program))
+        assert operand_types and set(operand_types) == {"f64"}, (program, operand_types)
+
+
 EXPORT_CLI = Path(__file__).resolve().parents[1] / "examples" / "export_model.py"
+
+
+def padded_graph(senders, receivers, max_atoms, max_edges):
+    """The plugin's layout: real edges first, then slots at index max_atoms with the mask off."""
+    pad_senders = np.full(max_edges, max_atoms, np.int32)
+    pad_receivers = np.full(max_edges, max_atoms, np.int32)
+    mask = np.zeros(max_edges, bool)
+    pad_senders[: len(senders)] = senders
+    pad_receivers[: len(receivers)] = receivers
+    mask[: len(senders)] = True
+    return LammpsNeighborList(jnp.asarray(pad_senders), jnp.asarray(pad_receivers), jnp.asarray(mask))
+
+
+def test_setfl_padded_edges_contribute_nothing(tmp_path):
+    """Padded slots leave setfl energies, forces and per-edge forces untouched and finite."""
+    path = tmp_path / "tiny.eam.alloy"
+    synthetic_setfl(path)
+    tables = load_setfl(str(path))
+    n_real, n_rows = 32, 48
+    positions_np = random_system(seed=23, n_atoms=n_real, box=(3.0, 2.0, 2.0))
+    species_np = np.random.default_rng(29).integers(0, 2, size=n_real, dtype=np.int32)
+    senders, receivers = edges_within_cutoff(positions_np, tables["cutoff"])
+    with jax.enable_x64():
+        positions = jnp.zeros((n_rows, 3), jnp.float64).at[:n_real].set(positions_np)
+        species = jnp.zeros((n_rows,), jnp.int32).at[:n_real].set(species_np)
+        exact = LammpsNeighborList(jnp.asarray(senders), jnp.asarray(receivers),
+                                   jnp.ones(len(senders), bool))
+        padded = padded_graph(senders, receivers, n_rows, 4 * len(senders))
+        energy_fn = make_setfl_energy(tables)
+
+        def owned_energy(pos, graph):
+            return jnp.sum(energy_fn(pos, species, graph)[:n_real])
+
+        e_exact, g_exact = jax.value_and_grad(owned_energy)(positions, exact)
+        e_padded, g_padded = jax.value_and_grad(owned_energy)(positions, padded)
+        assert float(e_padded) == pytest.approx(float(e_exact), rel=1e-12)
+        assert np.allclose(np.asarray(g_padded), np.asarray(g_exact), atol=1e-12)
+        assert np.all(np.isfinite(np.asarray(g_padded)))
+        assert np.all(np.asarray(g_padded)[n_real:] == 0.0)
+
+        edge_fn = make_setfl_edge_force(tables)
+        f_exact = np.asarray(edge_fn(positions, species, exact))
+        f_padded = np.asarray(edge_fn(positions, species, padded))
+        assert np.allclose(f_padded[: len(senders)], f_exact, atol=1e-12)
+        assert np.all(f_padded[len(senders):] == 0.0)
+
+
+def test_lj_example_padded_edges_contribute_nothing():
+    """The LJ example follows the same padding contract as the shipped builders."""
+    sys.path.insert(0, str(EXPORT_CLI.parent))
+    from export_model import make_lj_edge_force, make_lj_energy
+
+    n_real, n_rows = 32, 40
+    positions_np = random_system(seed=5, n_atoms=n_real, box=(3.0, 2.0, 2.0))
+    senders, receivers = edges_within_cutoff(positions_np, 1.6)
+    positions = jnp.zeros((n_rows, 3), jnp.float32).at[:n_real].set(positions_np)
+    species = jnp.zeros((n_rows,), jnp.int32)
+    exact = LammpsNeighborList(jnp.asarray(senders), jnp.asarray(receivers),
+                               jnp.ones(len(senders), bool))
+    padded = padded_graph(senders, receivers, n_rows, 3 * len(senders))
+    energy_fn = make_lj_energy(cutoff=1.6, epsilon=1.0, sigma=1.0)
+
+    def owned_energy(pos, graph):
+        return jnp.sum(energy_fn(pos, species, graph)[:n_real])
+
+    e_exact, g_exact = jax.value_and_grad(owned_energy)(positions, exact)
+    e_padded, g_padded = jax.value_and_grad(owned_energy)(positions, padded)
+    assert float(e_padded) == pytest.approx(float(e_exact), rel=1e-6)
+    assert np.allclose(np.asarray(g_padded), np.asarray(g_exact), atol=1e-5)
+    assert np.all(np.isfinite(np.asarray(g_padded)))
+    edge_fn = make_lj_edge_force(cutoff=1.6, epsilon=1.0, sigma=1.0)
+    f_padded = np.asarray(edge_fn(positions, species, padded))
+    assert np.allclose(f_padded[: len(senders)], np.asarray(edge_fn(positions, species, exact)), atol=1e-6)
+    assert np.all(f_padded[len(senders):] == 0.0)
 
 
 def run_export_cli(output, *extra):
@@ -550,6 +655,25 @@ def test_export_cli_hop_selection(tmp_path, extra, n_hops, pairing):
     assert contract["n_hops"] == n_hops
     assert contract["newton"] == "on"
     assert contract["edge_pairing"] == pairing
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [("--mode", "comm", "--half-edges"),
+     ("--setfl", "examples/potentials/CuZr.eam.alloy.gz", "--mode", "comm", "--half-edges",
+      "--force-output", "edge")],
+    ids=["comm-half", "comm-edge-force"],
+)
+def test_export_cli_float64_comm_forms(tmp_path, extra):
+    import json
+
+    output = tmp_path / "bundle.json"
+    result = run_export_cli(output, *extra, "--precision", "float64")
+    assert result.returncode == 0, result.stderr
+    data = json.loads(output.read_text())
+    assert data["contract"]["precision"] == "float64"
+    assert data["contract"]["comm_widths"]
+    assert set(EXCHANGE_OPERAND.findall(program_text(data, "force_mlir"))) == {"f64"}
 
 
 @pytest.mark.parametrize(

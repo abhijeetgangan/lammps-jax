@@ -63,22 +63,24 @@ ffi::Error model_comm_impl(bool forward, ffi::AnyBuffer features, ffi::AnyBuffer
 {
   if (user_data == nullptr || user_data->exchange == nullptr)
     return ffi::Error::Internal("model comm user data is not attached");
-  if (features.element_type() != ffi::DataType::F32)
-    return ffi::Error::InvalidArgument("model comm features must be float32");
+  const ffi::DataType type = features.element_type();
+  if (type != ffi::DataType::F32 && type != ffi::DataType::F64)
+    return ffi::Error::InvalidArgument("model comm features must be float32 or float64");
+  const size_t elem_bytes = ffi::ByteWidth(type);
   if (features.dimensions().size() != 2)
     return ffi::Error::InvalidArgument("model comm features must be rank 2");
   const int64_t rows = features.dimensions()[0];
   const int64_t width = features.dimensions()[1];
-  if (features_out->dimensions().size() != 2 || features_out->dimensions()[0] != rows ||
-      features_out->dimensions()[1] != width)
-    return ffi::Error::InvalidArgument("model comm output shape differs from input");
+  if (features_out->element_type() != type || features_out->dimensions().size() != 2 ||
+      features_out->dimensions()[0] != rows || features_out->dimensions()[1] != width)
+    return ffi::Error::InvalidArgument("model comm output type or shape differs from input");
 
   // Exceptions must not cross the FFI boundary.
   std::string error;
   try {
     error = user_data->exchange->comm_from_handler(
         forward, stream, features.untyped_data(), features_out->untyped_data(), rows, width,
-        token.untyped_data(), token_out->untyped_data());
+        elem_bytes, token.untyped_data(), token_out->untyped_data());
   } catch (const std::exception &exception) {
     error = exception.what();
   } catch (...) {
@@ -132,7 +134,8 @@ ModelComm::~ModelComm()
   }
 }
 
-void ModelComm::initialize(const PJRT_Api *api, int max_atoms, const std::vector<int> &widths)
+void ModelComm::initialize(const PJRT_Api *api, int max_atoms, const std::vector<int> &widths,
+                           size_t elem_bytes)
 {
   if (widths.empty()) throw std::runtime_error("ModelComm requires a non-empty width schedule");
   const PJRT_FFI_Extension *extension = find_ffi_extension(api);
@@ -153,6 +156,7 @@ void ModelComm::initialize(const PJRT_Api *api, int max_atoms, const std::vector
   api_ = api;
   max_atoms_ = max_atoms;
   widths_ = widths;
+  elem_bytes_ = elem_bytes;
 
   // Registration lives in the plugin's process-global registry: exactly once per process.
   static std::once_flag registered;
@@ -225,8 +229,8 @@ void ModelComm::initialize(const PJRT_Api *api, int max_atoms, const std::vector
   }
 
   const int max_width = *std::max_element(widths_.begin(), widths_.end());
-  check_cuda(cuMemHostAlloc(reinterpret_cast<void **>(&pinned_),
-                            static_cast<size_t>(max_atoms_) * max_width * sizeof(float), 0),
+  check_cuda(cuMemHostAlloc(&pinned_,
+                            static_cast<size_t>(max_atoms_) * max_width * elem_bytes_, 0),
              "allocate pinned model comm staging");
   check_cuda(cuEventCreate(&staged_event_, CU_EVENT_DISABLE_TIMING),
              "create model comm staging event");
@@ -326,9 +330,13 @@ void ModelComm::service_loop()
   servicing_ = false;
 }
 
-std::string ModelComm::validate_site(bool forward, int64_t rows, int64_t width)
+std::string ModelComm::validate_site(bool forward, int64_t rows, int64_t width,
+                                     size_t elem_bytes)
 {
   // Runs under mutex_. Validation is rank-identical, so failures abort before any MPI.
+  if (elem_bytes != elem_bytes_)
+    return describe_buffer_error("feature bytes", static_cast<int64_t>(elem_bytes),
+                                 static_cast<int64_t>(elem_bytes_));
   if (rows != max_atoms_)
     return describe_buffer_error("row count", rows, max_atoms_);
   const int total_sites = static_cast<int>(widths_.size());
@@ -351,8 +359,9 @@ std::string ModelComm::validate_site(bool forward, int64_t rows, int64_t width)
 }
 
 std::string ModelComm::comm_from_handler(bool forward, CUstream stream, const void *input,
-                                                void *output, int64_t rows, int64_t width,
-                                                const void *token_input, void *token_output)
+                                         void *output, int64_t rows, int64_t width,
+                                         size_t elem_bytes, const void *token_input,
+                                         void *token_output)
 {
   int nlocal = 0;
   int nghost = 0;
@@ -362,7 +371,7 @@ std::string ModelComm::comm_from_handler(bool forward, CUstream stream, const vo
     std::lock_guard<std::mutex> lock(mutex_);
     if (!servicing_)
       return "model comm invoked outside a serviced execution";
-    const std::string error = validate_site(forward, rows, width);
+    const std::string error = validate_site(forward, rows, width, elem_bytes);
     if (!error.empty()) return error;
     nlocal = nlocal_;
     nghost = nghost_;
@@ -370,7 +379,7 @@ std::string ModelComm::comm_from_handler(bool forward, CUstream stream, const vo
     pack_stream = pack_stream_;
   }
 
-  const size_t row_bytes = static_cast<size_t>(width) * sizeof(float);
+  const size_t row_bytes = static_cast<size_t>(width) * elem_bytes;
   const CUdeviceptr input_ptr = reinterpret_cast<CUdeviceptr>(input);
   const CUdeviceptr output_ptr = reinterpret_cast<CUdeviceptr>(output);
 
@@ -395,8 +404,7 @@ std::string ModelComm::comm_from_handler(bool forward, CUstream stream, const vo
   {
     std::unique_lock<std::mutex> lock(mutex_);
     request_ = ModelCommRequest{forward, device ? nullptr : pinned_, static_cast<int>(width),
-                                nlocal, nghost,
-                                device ? reinterpret_cast<float *>(output) : nullptr};
+                                nlocal, nghost, device ? output : nullptr};
     request_pending_ = true;
     condition_.notify_all();
     condition_.wait(lock, [&] { return !request_pending_; });
@@ -412,7 +420,8 @@ std::string ModelComm::comm_from_handler(bool forward, CUstream stream, const vo
   if (forward) {
     if (!device && nghost > 0)
       check_cuda(cuMemcpyHtoDAsync(output_ptr + static_cast<size_t>(nlocal) * row_bytes,
-                                   pinned_ + static_cast<size_t>(nlocal) * width,
+                                   static_cast<unsigned char *>(pinned_) +
+                                       static_cast<size_t>(nlocal) * row_bytes,
                                    static_cast<size_t>(nghost) * row_bytes, stream),
                  "model comm ghost rows to device");
   } else {

@@ -354,6 +354,7 @@ def run_export(args):
 
     z_table = [int(z) for z in cfg["atomic_numbers"]]
     type_table = jnp.asarray([z_table.index(z) for z in args.type_z], jnp.int32)
+    elements = sorted({int(i) for i in np.asarray(type_table)})
 
     if not args.skip_check:
         # Adapter vs mace_jax on a small free cluster of the first element;
@@ -366,7 +367,8 @@ def run_export(args):
         from ase.data import chemical_symbols
         e_ref, f_ref = ref(Atoms(chemical_symbols[args.type_z[0]] * 8,
                                  positions=pos, pbc=False))
-        fn = make_mace_energy(config=cfg, model=model, communicating=False)
+        fn = make_mace_energy(config=cfg, model=model, communicating=False,
+                              elements=elements)
         d = pos[None] - pos[:, None]
         r = np.sqrt((d ** 2).sum(-1))
         snd, rcv = np.nonzero((r < float(cfg["r_max"])) & ~np.eye(8, dtype=bool))
@@ -390,7 +392,8 @@ def run_export(args):
     communicating = args.mode == "comm"
     energy_fn = make_mace_energy(config=cfg, model=model,
                                  communicating=communicating,
-                                 owned_rows=args.owned_rows)
+                                 owned_rows=args.owned_rows,
+                                 elements=elements)
     n_types = len(args.type_z)
 
     if communicating:

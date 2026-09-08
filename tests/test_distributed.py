@@ -125,6 +125,34 @@ def test_exchange_batches_by_widening():
     assert "tensor<4x15xf32>" in text
 
 
+def test_exchange_lowers_at_comm_dtype():
+    """The matrix crosses the FFI at Comm's dtype; leaves come back in their own."""
+
+    def lower(dtype, spec):
+        c = comm.Comm(enabled=True, dtype=dtype)
+        return jax.jit(c.forward_comm).lower(spec).as_text()
+
+    def exchange_signature(mlir_float):
+        return (
+            f"(tensor<4x3x{mlir_float}>, tensor<f32>) -> "
+            f"(tensor<4x3x{mlir_float}>, tensor<f32>)"
+        )
+
+    with jax.enable_x64(True):
+        f64 = jax.ShapeDtypeStruct((4, 3), jnp.float64)
+        text = lower(jnp.float64, f64)
+        assert "tensor<4x3xf32>" not in text
+        # The token stays f32 whatever the matrix dtype.
+        assert exchange_signature("f64") in text
+        assert exchange_signature("f32") in lower(jnp.float32, f64)
+    assert exchange_signature("f32") in lower(
+        jnp.float32, jax.ShapeDtypeStruct((4, 3), jnp.float32)
+    )
+    for dtype in (jnp.int32, jnp.float16, jnp.bfloat16):
+        with pytest.raises(TypeError, match="float32 or float64"):
+            comm.Comm(dtype=dtype)
+
+
 # Export wiring
 
 
@@ -296,14 +324,6 @@ def never_communicates(positions, species, graph, comm_obj):
         (dict(half_edges=True, energy_fn=pair_energy), "half_edges requires"),
         (dict(energy_fn=pair_energy, max_owned=4),
          "max_owned needs a communicating"),
-        (
-            dict(
-                comm=True,
-                energy_fn=make_toy_mp_energy(cutoff=CUTOFF, communicating=True),
-                precision="float64",
-            ),
-            "float32-only",
-        ),
     ],
 )
 def test_export_rejects_invalid_distributed_configs(tmp_path, kwargs, message):

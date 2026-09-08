@@ -54,6 +54,8 @@ struct ExecutionResult {
 struct CommConfig {
   int max_atoms = 0;
   std::vector<int> widths;
+  // Bytes per exchanged feature; f64 bundles exchange doubles.
+  size_t elem_bytes = sizeof(float);
   // Services exchange requests on the engine's MPI thread.
   ModelComm::ServiceCallback callback;
 };

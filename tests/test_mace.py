@@ -84,6 +84,29 @@ def test_mace_adapter_matches_direct_mace_jax(mp_setup):
     )
 
 
+def test_mace_collapsed_skip_matches_full(mp_setup):
+    """Per-element skip matmuls reproduce the dense one-hot skip connection."""
+    config, model, positions_np, species_np = mp_setup
+    z_table = [int(z) for z in config["atomic_numbers"]]
+    aluminum, copper = z_table.index(13), z_table.index(29)
+    species = np.array(species_np)
+    species[::3] = copper
+    senders, receivers = edges_within_cutoff(positions_np, float(config["r_max"]))
+    args = (jnp.asarray(positions_np), jnp.asarray(species), Graph(senders, receivers))
+
+    full = make_mace_energy(config=config, model=model)
+    collapsed = make_mace_energy(config=config, model=model, elements=[aluminum, copper])
+    np.testing.assert_allclose(np.asarray(collapsed(*args)), np.asarray(full(*args)), atol=5e-5)
+    grad_full = jax.grad(lambda p: jnp.sum(full(p, *args[1:])))(args[0])
+    grad_collapsed = jax.grad(lambda p: jnp.sum(collapsed(p, *args[1:])))(args[0])
+    np.testing.assert_allclose(np.asarray(grad_collapsed), np.asarray(grad_full), atol=5e-4)
+    # A species outside the exported element list must fail loudly, not quietly.
+    aluminum_only = make_mace_energy(config=config, model=model, elements=[aluminum])
+    assert np.isnan(np.asarray(aluminum_only(*args))).any()
+    with pytest.raises(ValueError):
+        make_mace_energy(config=config, model=model, elements=[len(z_table)])
+
+
 @pytest.mark.parametrize(("exchange", "should_match"), [(True, True), (False, False)])
 def test_mace_comm_scheme_matches_reference(mp_setup, exchange, should_match):
     config, model, positions_np, species_np = mp_setup

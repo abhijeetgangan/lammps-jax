@@ -58,7 +58,8 @@ def flatten_features(features: Any) -> tuple[list[Any], Any, int, list[int]]:
 def comm_width(features: Any) -> int:
     """Total exchanged width of a feature pytree.
 
-    Float32 columns packed per atom row: sum over leaves of trailing-dimension products.
+    Columns packed per atom row at the exchange dtype: sum over leaves of
+    trailing-dimension products.
     """
     leaf_widths = flatten_features(features)[3]
     return int(sum(leaf_widths))
@@ -143,7 +144,7 @@ ad.primitive_transposes[reverse_exchange_p] = partial(
 
 
 def forward_exchange(matrix: jax.Array, token: jax.Array):
-    """Fill ghost rows of a [n_rows, width] float32 matrix from owner ranks."""
+    """Fill ghost rows of a [n_rows, width] float matrix from owner ranks."""
     return forward_exchange_p.bind(matrix, token)
 
 
@@ -157,12 +158,20 @@ class Comm:
 
     Use one instance per trace; with ``enabled=False`` exchanges are identities
     but widths are still recorded and checked against ``expected_widths``.
+    ``dtype`` is the exchanged matrix precision, the bundle's contract precision
+    in exports.
     """
 
     def __init__(
-        self, enabled: bool = True, expected_widths: Sequence[int] | None = None
+        self,
+        enabled: bool = True,
+        expected_widths: Sequence[int] | None = None,
+        dtype: Any = jnp.float32,
     ):
         self.enabled = bool(enabled)
+        self.dtype = jnp.dtype(dtype)
+        if self.dtype not in (jnp.dtype(jnp.float32), jnp.dtype(jnp.float64)):
+            raise TypeError(f"comm dtype must be float32 or float64; got {self.dtype}")
         self.expected_widths = (
             None if expected_widths is None else tuple(int(w) for w in expected_widths)
         )
@@ -207,13 +216,14 @@ class Comm:
         if not self.enabled:
             return features
 
-        # The FFI handler exchanges a single [n_rows, width] float32 matrix.
+        # The FFI handler exchanges a single [n_rows, width] matrix at the bundle precision.
         columns = [
-            jnp.reshape(leaf, (n_rows, leaf_width)).astype(jnp.float32)
+            jnp.reshape(leaf, (n_rows, leaf_width)).astype(self.dtype)
             for leaf, leaf_width in zip(leaves, leaf_widths)
         ]
         matrix = columns[0] if len(columns) == 1 else jnp.concatenate(columns, axis=1)
         if self.token is None:
+            # Ordering only; the handler copies sizeof(float), whatever the matrix dtype.
             self.token = jnp.zeros((), dtype=jnp.float32)
         matrix, self.token = exchange_fn(matrix, self.token)
 

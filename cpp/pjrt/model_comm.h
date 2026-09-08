@@ -19,15 +19,15 @@ namespace pjrt {
 
 struct ModelCommUserData;
 
-// One request, serviced on the engine's MPI thread; host_rows is pinned f32
-// staging, device_rows the in-place device buffer when device comm is active.
+// One request, serviced on the engine's MPI thread; host_rows is pinned staging of
+// contract-precision features, device_rows the in-place device buffer when device comm is active.
 struct ModelCommRequest {
   bool forward = true;
-  float *host_rows = nullptr;
+  void *host_rows = nullptr;
   int width = 0;
   int nlocal = 0;
   int nghost = 0;
-  float *device_rows = nullptr;
+  void *device_rows = nullptr;
 };
 
 class ModelComm {
@@ -40,7 +40,8 @@ class ModelComm {
   ~ModelComm();
 
   // Registers handlers and allocates pinned staging; must precede compiling communicating programs.
-  void initialize(const PJRT_Api *api, int max_atoms, const std::vector<int> &widths);
+  void initialize(const PJRT_Api *api, int max_atoms, const std::vector<int> &widths,
+                  size_t elem_bytes);
   void close(const PJRT_Api *api);
 
   PJRT_ExecuteContext *execute_context() const { return execute_context_; }
@@ -65,23 +66,25 @@ class ModelComm {
 
   // Called from FFI threads; blocks until serviced. Empty on success, else a rank-identical error.
   std::string comm_from_handler(bool forward, CUstream stream, const void *input,
-                                void *output, int64_t rows, int64_t width,
+                                void *output, int64_t rows, int64_t width, size_t elem_bytes,
                                 const void *token_input, void *token_output);
 
  private:
-  std::string validate_site(bool forward, int64_t rows, int64_t width);
+  std::string validate_site(bool forward, int64_t rows, int64_t width, size_t elem_bytes);
 
   // Registration + execute-context state.
   ModelCommUserData *user_data_ = nullptr;
   PJRT_ExecuteContext *execute_context_ = nullptr;
   const PJRT_Api *api_ = nullptr;
 
-  // Static capacity/schedule from the bundle contract.
+  // Static capacity/schedule/feature size from the bundle contract.
   int max_atoms_ = 0;
   std::vector<int> widths_;
+  size_t elem_bytes_ = sizeof(float);
 
-  // Pinned staging shared by all sites; the token chain serializes communications.
-  float *pinned_ = nullptr;
+  // Pinned staging shared by all sites, elem_bytes_ per feature; the token chain
+  // serializes communications.
+  void *pinned_ = nullptr;
   CUevent staged_event_ = nullptr;
   CUevent unpacked_event_ = nullptr;
 

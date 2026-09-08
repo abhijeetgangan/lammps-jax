@@ -311,7 +311,8 @@ void Runtime::initialize(const std::string &plugin_path, const std::string &forc
   register_external_ffi_handlers(library_, custom_call_targets);
   if (!comm_config.widths.empty()) {
     model_comm_ = std::make_unique<ModelComm>();
-    model_comm_->initialize(library_.api(), comm_config.max_atoms, comm_config.widths);
+    model_comm_->initialize(library_.api(), comm_config.max_atoms, comm_config.widths,
+                            comm_config.elem_bytes);
     if (comm_config.callback) model_comm_->set_service_callback(comm_config.callback);
   }
   force_executable_ =

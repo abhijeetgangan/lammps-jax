@@ -23,6 +23,7 @@
 #include <cuda.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -191,67 +192,67 @@ struct VirialFDotRFunctor {
   }
 };
 
-// Model comm rows are f32; two features bit-pack per double slot, matching the
-// host callbacks. One thread per element: wide exchanges stay coalesced.
-struct PackCommRowsByList {
+// Comm rows move as 4-byte words, one thread per word so wide exchanges stay coalesced.
+struct PackCommWordsByList {
   typename ArrayTypes<LMPDeviceType>::t_int_1d sendlist;
   typename ArrayTypes<LMPDeviceType>::t_double_1d buf;
-  const float *rows;
-  int width;
+  const uint32_t *rows;
+  int words;
   int slots;
 
   KOKKOS_INLINE_FUNCTION
   void operator()(const int64_t flat) const
   {
-    const int i = static_cast<int>(flat / width);
-    const int w = static_cast<int>(flat % width);
-    const float *row = rows + static_cast<size_t>(sendlist(i)) * width;
-    float *packed = reinterpret_cast<float *>(&buf(static_cast<size_t>(i) * slots));
-    packed[w] = row[w];
-    if ((width & 1) && w + 1 == width) packed[width] = 0.0f;
+    const int i = static_cast<int>(flat / words);
+    const int w = static_cast<int>(flat % words);
+    uint32_t *packed = reinterpret_cast<uint32_t *>(&buf(static_cast<size_t>(i) * slots));
+    packed[w] = rows[static_cast<size_t>(sendlist(i)) * words + w];
+    if ((words & 1) && w + 1 == words) packed[words] = 0;
   }
 };
 
-struct UnpackCommRowsAt {
+struct UnpackCommWordsAt {
   typename ArrayTypes<LMPDeviceType>::t_double_1d buf;
-  float *rows;
-  int width;
+  uint32_t *rows;
+  int words;
   int slots;
   int first;
 
   KOKKOS_INLINE_FUNCTION
   void operator()(const int64_t flat) const
   {
-    const int i = static_cast<int>(flat / width);
-    const int w = static_cast<int>(flat % width);
-    rows[static_cast<size_t>(first + i) * width + w] =
-        reinterpret_cast<const float *>(&buf(static_cast<size_t>(i) * slots))[w];
+    const int i = static_cast<int>(flat / words);
+    const int w = static_cast<int>(flat % words);
+    rows[static_cast<size_t>(first + i) * words + w] =
+        reinterpret_cast<const uint32_t *>(&buf(static_cast<size_t>(i) * slots))[w];
   }
 };
 
-struct PackCommRowsAt {
+struct PackCommWordsAt {
   typename ArrayTypes<LMPDeviceType>::t_double_1d buf;
-  const float *rows;
-  int width;
+  const uint32_t *rows;
+  int words;
   int slots;
   int first;
 
   KOKKOS_INLINE_FUNCTION
   void operator()(const int64_t flat) const
   {
-    const int i = static_cast<int>(flat / width);
-    const int w = static_cast<int>(flat % width);
-    float *packed = reinterpret_cast<float *>(&buf(static_cast<size_t>(i) * slots));
-    packed[w] = rows[static_cast<size_t>(first + i) * width + w];
-    if ((width & 1) && w + 1 == width) packed[width] = 0.0f;
+    const int i = static_cast<int>(flat / words);
+    const int w = static_cast<int>(flat % words);
+    uint32_t *packed = reinterpret_cast<uint32_t *>(&buf(static_cast<size_t>(i) * slots));
+    packed[w] = rows[static_cast<size_t>(first + i) * words + w];
+    if ((words & 1) && w + 1 == words) packed[words] = 0;
   }
 };
 
-// Adjoint accumulation; sendlist indices are unique within a swap.
+// Adjoint accumulation is arithmetic, so it alone sees the feature type;
+// sendlist indices are unique within a swap.
+template <typename Scalar>
 struct AddCommRowsByList {
   typename ArrayTypes<LMPDeviceType>::t_int_1d sendlist;
   typename ArrayTypes<LMPDeviceType>::t_double_1d buf;
-  float *rows;
+  Scalar *rows;
   int width;
   int slots;
 
@@ -261,7 +262,7 @@ struct AddCommRowsByList {
     const int i = static_cast<int>(flat / width);
     const int w = static_cast<int>(flat % width);
     rows[static_cast<size_t>(sendlist(i)) * width + w] +=
-        reinterpret_cast<const float *>(&buf(static_cast<size_t>(i) * slots))[w];
+        reinterpret_cast<const Scalar *>(&buf(static_cast<size_t>(i) * slots))[w];
   }
 };
 
@@ -360,22 +361,18 @@ bool PairJaxKokkos::f64_enabled() const
   return bundle.contract.precision == lammps_jax::Precision::Float64;
 }
 
-// Pair comm buffers are opaque doubles end to end; two f32 features bit-pack per double slot.
-static inline int comm_double_slots(int width)
-{
-  return (width + 1) / 2;
-}
-
 // Runs on the LAMMPS MPI thread while execution waits in the FFI handler.
 void PairJaxKokkos::service_model_comm(const pjrt::ModelCommRequest &request)
 {
   comm_width = request.width;
+  // ModelComm validated the feature bytes against the contract, so comm_slots is exact.
+  const int slots = comm_slots(comm_width);
   if (request.device_rows) {
     d_comm_rows = request.device_rows;
     if (request.forward)
-      comm->forward_comm(this, comm_double_slots(comm_width));
+      comm->forward_comm(this, slots);
     else
-      comm->reverse_comm(this, comm_double_slots(comm_width));
+      comm->reverse_comm(this, slots);
     // The model stream waits on the unpack through events; no host fence.
     d_comm_rows = nullptr;
   } else {
@@ -383,9 +380,9 @@ void PairJaxKokkos::service_model_comm(const pjrt::ModelCommRequest &request)
     const ExecutionSpace saved_space = execution_space;
     execution_space = Host;
     if (request.forward)
-      comm->forward_comm(this, comm_double_slots(comm_width));
+      comm->forward_comm(this, slots);
     else
-      comm->reverse_comm(this, comm_double_slots(comm_width));
+      comm->reverse_comm(this, slots);
     execution_space = saved_space;
     comm_rows = nullptr;
   }
@@ -395,34 +392,36 @@ void PairJaxKokkos::service_model_comm(const pjrt::ModelCommRequest &request)
 int PairJaxKokkos::pack_forward_comm(int n, int *list, double *buf, int /*pbc_flag*/, int * /*pbc*/)
 {
   // Feature rows are not coordinates, so periodic image shifts do not apply.
-  const int slots = comm_double_slots(comm_width);
+  const size_t row_bytes = comm_width * comm_elem_bytes();
+  const int slots = comm_slots(comm_width);
+  const auto *rows = static_cast<const unsigned char *>(comm_rows);
   for (int i = 0; i < n; ++i) {
-    const float *row = comm_rows + static_cast<size_t>(list[i]) * comm_width;
-    float *packed = reinterpret_cast<float *>(buf + static_cast<size_t>(i) * slots);
-    for (int w = 0; w < comm_width; ++w) packed[w] = row[w];
-    if (comm_width & 1) packed[comm_width] = 0.0f;
+    double *packed = buf + static_cast<size_t>(i) * slots;
+    if (row_bytes % sizeof(double)) packed[slots - 1] = 0.0;
+    std::memcpy(packed, rows + static_cast<size_t>(list[i]) * row_bytes, row_bytes);
   }
   return n * slots;
 }
 
 void PairJaxKokkos::unpack_forward_comm(int n, int first, double *buf)
 {
-  const int slots = comm_double_slots(comm_width);
-  for (int i = 0; i < n; ++i) {
-    float *row = comm_rows + static_cast<size_t>(first + i) * comm_width;
-    const float *packed = reinterpret_cast<const float *>(buf + static_cast<size_t>(i) * slots);
-    for (int w = 0; w < comm_width; ++w) row[w] = packed[w];
-  }
+  const size_t row_bytes = comm_width * comm_elem_bytes();
+  const int slots = comm_slots(comm_width);
+  auto *rows = static_cast<unsigned char *>(comm_rows);
+  for (int i = 0; i < n; ++i)
+    std::memcpy(rows + static_cast<size_t>(first + i) * row_bytes,
+                buf + static_cast<size_t>(i) * slots, row_bytes);
 }
 
 int PairJaxKokkos::pack_reverse_comm(int n, int first, double *buf)
 {
-  const int slots = comm_double_slots(comm_width);
+  const size_t row_bytes = comm_width * comm_elem_bytes();
+  const int slots = comm_slots(comm_width);
+  const auto *rows = static_cast<const unsigned char *>(comm_rows);
   for (int i = 0; i < n; ++i) {
-    const float *row = comm_rows + static_cast<size_t>(first + i) * comm_width;
-    float *packed = reinterpret_cast<float *>(buf + static_cast<size_t>(i) * slots);
-    for (int w = 0; w < comm_width; ++w) packed[w] = row[w];
-    if (comm_width & 1) packed[comm_width] = 0.0f;
+    double *packed = buf + static_cast<size_t>(i) * slots;
+    if (row_bytes % sizeof(double)) packed[slots - 1] = 0.0;
+    std::memcpy(packed, rows + static_cast<size_t>(first + i) * row_bytes, row_bytes);
   }
   return n * slots;
 }
@@ -430,12 +429,16 @@ int PairJaxKokkos::pack_reverse_comm(int n, int first, double *buf)
 void PairJaxKokkos::unpack_reverse_comm(int n, int *list, double *buf)
 {
   // Adjoint accumulation: ghost-row cotangents sum into their owner rows.
-  const int slots = comm_double_slots(comm_width);
-  for (int i = 0; i < n; ++i) {
-    float *row = comm_rows + static_cast<size_t>(list[i]) * comm_width;
-    const float *packed = reinterpret_cast<const float *>(buf + static_cast<size_t>(i) * slots);
-    for (int w = 0; w < comm_width; ++w) row[w] += packed[w];
-  }
+  const int slots = comm_slots(comm_width);
+  dispatch_by_precision([&](auto p) {
+    auto *rows = static_cast<decltype(p) *>(comm_rows);
+    for (int i = 0; i < n; ++i) {
+      const auto *packed =
+          reinterpret_cast<const decltype(p) *>(buf + static_cast<size_t>(i) * slots);
+      for (int w = 0; w < comm_width; ++w)
+        rows[static_cast<size_t>(list[i]) * comm_width + w] += packed[w];
+    }
+  });
 }
 
 #ifdef KOKKOS_ENABLE_CUDA
@@ -443,43 +446,50 @@ int PairJaxKokkos::pack_forward_comm_kokkos(int n, DAT::tdual_int_1d k_sendlist,
                                             DAT::tdual_double_1d &k_buf, int /*pbc_flag*/,
                                             int * /*pbc*/)
 {
-  const int slots = comm_double_slots(comm_width);
+  const int words = comm_words();
+  const int slots = comm_slots(comm_width);
   Kokkos::parallel_for(
       "LAMMPSJAX::pack_forward_comm",
-      Kokkos::RangePolicy<LMPDeviceType>(0, static_cast<int64_t>(n) * comm_width),
-      PackCommRowsByList{k_sendlist.view<LMPDeviceType>(), k_buf.view<LMPDeviceType>(),
-                         d_comm_rows, comm_width, slots});
+      Kokkos::RangePolicy<LMPDeviceType>(0, static_cast<int64_t>(n) * words),
+      PackCommWordsByList{k_sendlist.view<LMPDeviceType>(), k_buf.view<LMPDeviceType>(),
+                          static_cast<const uint32_t *>(d_comm_rows), words, slots});
   return n * slots;
 }
 
 void PairJaxKokkos::unpack_forward_comm_kokkos(int n, int first, DAT::tdual_double_1d &k_buf)
 {
-  const int slots = comm_double_slots(comm_width);
+  const int words = comm_words();
   Kokkos::parallel_for(
       "LAMMPSJAX::unpack_forward_comm",
-      Kokkos::RangePolicy<LMPDeviceType>(0, static_cast<int64_t>(n) * comm_width),
-      UnpackCommRowsAt{k_buf.view<LMPDeviceType>(), d_comm_rows, comm_width, slots, first});
+      Kokkos::RangePolicy<LMPDeviceType>(0, static_cast<int64_t>(n) * words),
+      UnpackCommWordsAt{k_buf.view<LMPDeviceType>(), static_cast<uint32_t *>(d_comm_rows), words,
+                        comm_slots(comm_width), first});
 }
 
 int PairJaxKokkos::pack_reverse_comm_kokkos(int n, int first, DAT::tdual_double_1d &k_buf)
 {
-  const int slots = comm_double_slots(comm_width);
+  const int words = comm_words();
+  const int slots = comm_slots(comm_width);
   Kokkos::parallel_for(
       "LAMMPSJAX::pack_reverse_comm",
-      Kokkos::RangePolicy<LMPDeviceType>(0, static_cast<int64_t>(n) * comm_width),
-      PackCommRowsAt{k_buf.view<LMPDeviceType>(), d_comm_rows, comm_width, slots, first});
+      Kokkos::RangePolicy<LMPDeviceType>(0, static_cast<int64_t>(n) * words),
+      PackCommWordsAt{k_buf.view<LMPDeviceType>(), static_cast<const uint32_t *>(d_comm_rows),
+                      words, slots, first});
   return n * slots;
 }
 
 void PairJaxKokkos::unpack_reverse_comm_kokkos(int n, DAT::tdual_int_1d k_sendlist,
                                                DAT::tdual_double_1d &k_buf)
 {
-  const int slots = comm_double_slots(comm_width);
-  Kokkos::parallel_for(
-      "LAMMPSJAX::unpack_reverse_comm",
-      Kokkos::RangePolicy<LMPDeviceType>(0, static_cast<int64_t>(n) * comm_width),
-      AddCommRowsByList{k_sendlist.view<LMPDeviceType>(), k_buf.view<LMPDeviceType>(),
-                        d_comm_rows, comm_width, slots});
+  const int slots = comm_slots(comm_width);
+  dispatch_by_precision([&](auto p) {
+    using Scalar = decltype(p);
+    Kokkos::parallel_for(
+        "LAMMPSJAX::unpack_reverse_comm",
+        Kokkos::RangePolicy<LMPDeviceType>(0, static_cast<int64_t>(n) * comm_width),
+        AddCommRowsByList<Scalar>{k_sendlist.view<LMPDeviceType>(), k_buf.view<LMPDeviceType>(),
+                                  static_cast<Scalar *>(d_comm_rows), comm_width, slots});
+  });
 }
 #endif
 
@@ -529,6 +539,7 @@ void PairJaxKokkos::coeff(int narg, char **arg)
     if (comm_enabled()) {
       comm_config.max_atoms = bundle.contract.max_atoms;
       comm_config.widths = bundle.contract.comm_widths;
+      comm_config.elem_bytes = comm_elem_bytes();
       comm_config.callback =
           [this](const pjrt::ModelCommRequest &request) { service_model_comm(request); };
     }
@@ -540,11 +551,10 @@ void PairJaxKokkos::coeff(int narg, char **arg)
         bundle.compile_options, client_options, comm_config,
         bundle.contract.custom_call_targets);
     if (comm_enabled()) {
-      // LAMMPS sizes pair comm buffers once at init, in doubles; two f32 features per slot.
+      // LAMMPS sizes pair comm buffers once at init, in doubles.
       int max_width = 0;
       for (const int width : bundle.contract.comm_widths) max_width = MAX(max_width, width);
-      comm_forward = (max_width + 1) / 2;
-      comm_reverse = (max_width + 1) / 2;
+      comm_forward = comm_reverse = comm_slots(max_width);
     }
     allocate_device_buffers();
     model_loaded = true;
