@@ -80,9 +80,9 @@ struct PackNeighborFunctor {
   KOKKOS_INLINE_FUNCTION
   void operator()(const int flat) const
   {
-    const int ii = flat / max_neighbors_per_atom;
-    const int jj = flat - ii * max_neighbors_per_atom;
-    if (ii >= num_rows) return;
+    // Atom-fastest: a warp reads consecutive list rows and packs consecutive senders.
+    const int ii = flat % num_rows;
+    const int jj = flat / num_rows;
     const int i = list.d_ilist(ii);
     if (i >= max_atoms || jj >= list.d_numneigh(i)) return;
     const int j = list.d_neighbors(i, jj) & NEIGHMASK;
@@ -92,7 +92,7 @@ struct PackNeighborFunctor {
     const double dy = x(i, 1) - x(j, 1);
     const double dz = x(i, 2) - x(j, 2);
     if (dx * dx + dy * dy + dz * dz > cutsq) return;
-    // Half-edge bundles keep one direction per pair; symmetrized models would double count.
+    // A full list holds both directions; half-edge bundles keep one or would double count.
     if (half_edges && j < i) return;
     // Native half-list rule: the ghost's shifted coordinates pick one rank per pair.
     if (unique_boundary && j >= nlocal) {
@@ -117,6 +117,24 @@ struct PackNeighborFunctor {
       receivers_out(edge + 1) = i;
       edge_mask_out(edge + 1) = true;
     }
+  }
+};
+
+// Slots past the new count still hold last step's edges; restore the padding there.
+struct ResetEdgeTailFunctor {
+  Kokkos::View<int *, LMPDeviceType> senders;
+  Kokkos::View<int *, LMPDeviceType> receivers;
+  Kokkos::View<bool *, LMPDeviceType> edge_mask;
+  Kokkos::View<int, LMPDeviceType> edge_count;
+  int max_atoms;
+
+  KOKKOS_INLINE_FUNCTION
+  void operator()(const int e) const
+  {
+    if (e < edge_count()) return;
+    senders(e) = max_atoms;
+    receivers(e) = max_atoms;
+    edge_mask(e) = false;
   }
 };
 
@@ -246,8 +264,7 @@ struct PackCommWordsAt {
   }
 };
 
-// Adjoint accumulation is arithmetic, so it alone sees the feature type;
-// sendlist indices are unique within a swap.
+// The adjoint add is the only arithmetic, so it alone sees the feature type; sendlist is unique.
 template <typename Scalar>
 struct AddCommRowsByList {
   typename ArrayTypes<LMPDeviceType>::t_int_1d sendlist;
@@ -326,6 +343,9 @@ void PairJaxKokkos::allocate_device_buffers()
   d_senders = int_view("lammps_jax_senders", max_edges);
   d_receivers = int_view("lammps_jax_receivers", max_edges);
   d_edge_mask = bool_view("lammps_jax_edge_mask", max_edges);
+  // Padding contract: unpacked slots index past the atom rows; the pack keeps it per step.
+  Kokkos::deep_copy(d_senders, max_atoms);
+  Kokkos::deep_copy(d_receivers, max_atoms);
   // Rank-local failure: the throw reaches coeff()'s catch, which error->one's.
   if (input_ready_event == nullptr &&
       cuEventCreate(&input_ready_event, CU_EVENT_DISABLE_TIMING) != CUDA_SUCCESS)
@@ -359,6 +379,14 @@ bool PairJaxKokkos::comm_enabled() const
 bool PairJaxKokkos::f64_enabled() const
 {
   return bundle.contract.precision == lammps_jax::Precision::Float64;
+}
+
+// Bundles that need one direction per pair take the native half list, owned-ghost rule included.
+bool PairJaxKokkos::half_list() const
+{
+  if (!force->newton_pair) return false;
+  if (comm_enabled()) return bundle.contract.half_edges;
+  return bundle.contract.n_hops == 1 && (edge_force_enabled() || bundle.contract.pair_sum);
 }
 
 // Runs on the LAMMPS MPI thread while execution waits in the FFI handler.
@@ -635,7 +663,7 @@ void PairJaxKokkos::init_style()
       utils::logmesg(lmp,
                      "LAMMPS-JAX: using newton pair on with a Kokkos {} neighbor list; "
                      "ghost force rows are accumulated for LAMMPS reverse communication.\n",
-                     edge_force_enabled() || bundle.contract.pair_sum ? "half" : "full");
+                     half_list() ? "half" : "full");
     if (bundle.programs.energy_and_forces_mlir.empty())
       utils::logmesg(lmp,
                      "LAMMPS-JAX: force-only bundle; pair energy is reported as zero.\n");
@@ -645,7 +673,7 @@ void PairJaxKokkos::init_style()
                      "pressure output excludes pair contributions in this run.\n");
   }
   if (comm_enabled()) {
-    // Full list: owned atoms need complete rows; ghost features arrive via the exchange.
+    // Full pairing needs complete owned rows; half-edge bundles complete them through the exchange.
     if (atom->molecular != Atom::ATOMIC) {
       for (int n = 1; n <= 3; ++n) {
         if (force->special_lj[n] != 1.0)
@@ -653,7 +681,8 @@ void PairJaxKokkos::init_style()
                      "Communicating LAMMPS-JAX bundles require special_bonds 1 1 1");
       }
     }
-    auto request = neighbor->add_request(this, NeighConst::REQ_FULL);
+    auto request = half_list() ? neighbor->add_request(this)
+                               : neighbor->add_request(this, NeighConst::REQ_FULL);
     request->set_kokkos_device(true);
     request->set_kokkos_host(false);
     return;
@@ -686,11 +715,8 @@ void PairJaxKokkos::init_style()
     request->set_kokkos_host(false);
     return;
   }
-  // Full list keeps owned rows complete; edge-force and pair-sum bundles keep the half list.
-  const bool half_list_ok = edge_force_enabled() || bundle.contract.pair_sum;
-  auto request = half_list_ok && force->newton_pair
-      ? neighbor->add_request(this)
-      : neighbor->add_request(this, NeighConst::REQ_FULL);
+  auto request = half_list() ? neighbor->add_request(this)
+                             : neighbor->add_request(this, NeighConst::REQ_FULL);
   request->set_kokkos_device(true);
   request->set_kokkos_host(false);
 }
@@ -726,9 +752,6 @@ void PairJaxKokkos::pack_edges(NeighListKokkos<PairJaxKokkos::device_type> *klis
   if (rebuild_edges) {
     Kokkos::deep_copy(exec, d_edge_count, 0);
     Kokkos::deep_copy(exec, d_edge_overflow, 0);
-    Kokkos::deep_copy(exec, d_edge_mask, false);
-    Kokkos::deep_copy(exec, d_senders, bundle.contract.max_atoms);
-    Kokkos::deep_copy(exec, d_receivers, bundle.contract.max_atoms);
 
     const int max_neighbors_per_atom = std::max(1, klist->maxneighs);
     // Ghost features feed owned energies, so every ghost needs its full neighborhood.
@@ -746,6 +769,8 @@ void PairJaxKokkos::pack_edges(NeighListKokkos<PairJaxKokkos::device_type> *klis
     const bool duplicate_reverse_edges =
         force->newton_pair && bundle.contract.pair_sum && !edge_force_enabled() &&
         !multi_hop && !comm_enabled();
+    // The native half list already holds one direction per pair, chosen by bin, not by index.
+    const bool full_list = !half_list();
     Kokkos::parallel_for(
         "LAMMPSJAX::pack_neighbors",
         Kokkos::RangePolicy<LMPDeviceType>(exec, 0, num_rows * max_neighbors_per_atom),
@@ -754,10 +779,16 @@ void PairJaxKokkos::pack_edges(NeighListKokkos<PairJaxKokkos::device_type> *klis
                                            bundle.contract.max_atoms, bundle.contract.max_edges,
                                            max_neighbors_per_atom, num_rows,
                                            duplicate_reverse_edges,
-                                           bundle.contract.half_edges,
-                                           bundle.contract.half_edges && comm_enabled(),
+                                           bundle.contract.half_edges && full_list,
+                                           bundle.contract.half_edges && comm_enabled() &&
+                                               full_list,
                                            atom->nlocal,
                                            bundle.contract.cutoff * bundle.contract.cutoff, x});
+    if (cached_edge_count > 0)
+      Kokkos::parallel_for("LAMMPSJAX::reset_edge_tail",
+                           Kokkos::RangePolicy<LMPDeviceType>(exec, 0, cached_edge_count),
+                           ResetEdgeTailFunctor{d_senders, d_receivers, d_edge_mask, d_edge_count,
+                                                bundle.contract.max_atoms});
   }
 }
 

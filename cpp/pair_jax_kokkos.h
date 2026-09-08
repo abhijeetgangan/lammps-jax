@@ -62,6 +62,7 @@ class PairJaxKokkos : public Pair, public KokkosBase {
   bool edge_force_enabled() const;
   bool comm_enabled() const;
   bool f64_enabled() const;
+  bool half_list() const;
   // Calls f with a float or double value per the contract precision; f deduces Scalar from it.
   template <typename F>
   auto dispatch_by_precision(F &&f)

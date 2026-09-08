@@ -37,15 +37,15 @@ def make_lj_energy(*, cutoff: float, epsilon: float, sigma: float, edge_energy_s
     def lj_energy(positions, species, graph):
         del species
         dtype = positions.dtype
-        rij = (positions.at[graph.receivers].get(mode="fill", fill_value=0)
-               - positions.at[graph.senders].get(mode="fill", fill_value=0))
+        rij = (positions.at[graph.receivers].get(mode="promise_in_bounds")
+               - positions.at[graph.senders].get(mode="promise_in_bounds"))
         r_sq = jnp.sum(rij * rij, axis=-1)
         valid, per_edge = lj_energy_terms(r_sq, graph.edge_mask, **params)
         per_edge = jnp.asarray(edge_energy_scale, dtype) * jnp.where(
             valid, per_edge, jnp.asarray(0.0, dtype)
         )
         zeros = jnp.zeros((positions.shape[0],), dtype=dtype)
-        return zeros.at[graph.senders].add(per_edge, mode="drop")
+        return zeros.at[graph.senders].add(per_edge, mode="promise_in_bounds")
 
     return lj_energy
 
@@ -66,8 +66,8 @@ def make_lj_edge_force(*, cutoff: float, epsilon: float, sigma: float):
 
     def lj_edge_force(positions, species, graph):
         del species
-        rij = (positions.at[graph.receivers].get(mode="fill", fill_value=0)
-               - positions.at[graph.senders].get(mode="fill", fill_value=0))
+        rij = (positions.at[graph.receivers].get(mode="promise_in_bounds")
+               - positions.at[graph.senders].get(mode="promise_in_bounds"))
         edge_force = edge_grad(rij)
         return jnp.where(graph.edge_mask[:, None], edge_force, jnp.asarray(0.0, edge_force.dtype))
 

@@ -19,8 +19,7 @@ namespace pjrt {
 
 struct ModelCommUserData;
 
-// One request, serviced on the engine's MPI thread; host_rows is pinned staging of
-// contract-precision features, device_rows the in-place device buffer when device comm is active.
+// One request for the engine's MPI thread: pinned host_rows, or device_rows for device comm.
 struct ModelCommRequest {
   bool forward = true;
   void *host_rows = nullptr;
@@ -82,8 +81,7 @@ class ModelComm {
   std::vector<int> widths_;
   size_t elem_bytes_ = sizeof(float);
 
-  // Pinned staging shared by all sites, elem_bytes_ per feature; the token chain
-  // serializes communications.
+  // Pinned staging shared by all sites, elem_bytes_ per feature; the token chain serializes them.
   void *pinned_ = nullptr;
   CUevent staged_event_ = nullptr;
   CUevent unpacked_event_ = nullptr;

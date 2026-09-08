@@ -1,8 +1,8 @@
 """Export JAX energy or force callables as fixed-capacity VHLO bundles for pair_style jax/kk.
 
-Padding edges carry senders = receivers = max_atoms with edge_mask false. Gather
-with mode="fill" and scatter with mode="drop" so padding reads zeros and is dropped
-instead of piling onto row 0, and guard divisions or the gradient goes NaN.
+Padding edges carry senders = receivers = max_atoms with edge_mask false. Index with
+mode="promise_in_bounds": XLA clamps the gathers and drops the scatters without mask
+arrays, so mask every edge term with edge_mask and guard divisions or the gradient goes NaN.
 """
 
 import base64
