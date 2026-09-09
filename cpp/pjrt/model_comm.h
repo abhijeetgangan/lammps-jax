@@ -58,8 +58,9 @@ class ModelComm {
     pack_stream_ = pack_stream;
   }
 
-  // Protocol: begin_service; worker executes and marks done; service_loop; worker.get.
-  void begin_service();
+  // Protocol: begin_service(n); the worker executes and marks done; service_loop returns
+  // after n requests, or after done when n is negative.
+  void begin_service(int expected_requests);
   void mark_execution_done();
   void service_loop();
 
@@ -96,6 +97,8 @@ class ModelComm {
   bool device_rows_ = false;
   CUstream pack_stream_ = nullptr;
   bool done_ = false;
+  int expected_requests_ = -1;
+  int serviced_requests_ = 0;
   int nlocal_ = 0;
   int nghost_ = 0;
   int forward_site_ = 0;

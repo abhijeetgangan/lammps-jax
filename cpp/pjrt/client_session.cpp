@@ -65,7 +65,9 @@ void ClientSession::initialize(const PluginLibrary &library, const ClientOptions
 
   stream_extension_ = reinterpret_cast<PJRT_Stream_Extension_Local *>(
       library.find_extension(PJRT_Extension_Type_Stream));
-  if (stream_extension_ == nullptr || stream_extension_->get_stream == nullptr)
+  if (stream_extension_ == nullptr || stream_extension_->get_stream == nullptr ||
+      stream_extension_->base.struct_size < sizeof(PJRT_Stream_Extension_Local) ||
+      stream_extension_->wait_stream == nullptr)
     throw std::runtime_error("PJRT CUDA stream extension is required for device stream handoff");
 }
 
@@ -92,6 +94,16 @@ CUstream ClientSession::input_stream_for(const PluginLibrary &library) const
   library.check(stream_extension_->get_stream(&args),
                 "PJRT_Get_Stream_For_External_Ready_Events");
   return reinterpret_cast<CUstream>(args.stream);
+}
+
+void ClientSession::wait_until_ready(const PluginLibrary &library, PJRT_Buffer *buffer,
+                                     CUstream stream) const
+{
+  PJRT_Wait_Until_Buffer_Ready_On_Stream_Args_Local args{};
+  args.struct_size = sizeof(PJRT_Wait_Until_Buffer_Ready_On_Stream_Args_Local);
+  args.stream = reinterpret_cast<intptr_t>(stream);
+  args.buffer = buffer;
+  library.check(stream_extension_->wait_stream(&args), "PJRT_Wait_Until_Buffer_Ready_On_Stream");
 }
 
 } // namespace pjrt

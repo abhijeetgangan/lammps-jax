@@ -164,6 +164,13 @@ def spline_lookup(tables, table_ids, x, delta, extrapolate=False, derivative=Fal
     return value + (t_raw - t) * end_slope
 
 
+def pair_table_id(a, b):
+    """Row of the setfl pair table for elements a and b: lower triangle in file order."""
+    hi = jnp.maximum(a, b).astype(jnp.int32)
+    lo = jnp.minimum(a, b).astype(jnp.int32)
+    return hi * (hi + 1) // 2 + lo
+
+
 def load_setfl(path: str) -> dict:
     """Parse a DYNAMO setfl (.eam.alloy) file into spline-ready tables.
 
@@ -270,7 +277,6 @@ def make_setfl_energy(tables: dict, *, communicating: bool = False,
         embedding = jnp.asarray(tables["embedding"], dtype)
         density_tables = jnp.asarray(tables["density"], dtype)
         pair_tables = jnp.asarray(tables["pair"], dtype)
-        pair_index = jnp.asarray(tables["pair_index"])
         cutoff_sq = jnp.asarray(cutoff * cutoff, dtype)
         zero = jnp.asarray(0.0, dtype)
         one = jnp.asarray(1.0, dtype)
@@ -282,14 +288,16 @@ def make_setfl_energy(tables: dict, *, communicating: bool = False,
         valid = graph.edge_mask & (r_sq < cutoff_sq)
         # Nonzero fallback keeps sqrt and the phi division autodiff-safe.
         r = jnp.sqrt(jnp.where(valid, r_sq, one))
-        sender_species = species.at[senders].get(mode="promise_in_bounds")
-        receiver_species = species.at[receivers].get(mode="promise_in_bounds")
+        # int8 per edge: XLA keeps these gathers in memory for their several consumers.
+        species8 = species.astype(jnp.int8)
+        sender_species = species8.at[senders].get(mode="promise_in_bounds")
+        receiver_species = species8.at[receivers].get(mode="promise_in_bounds")
 
         n_atoms = positions.shape[0]
         zeros = jnp.zeros((n_atoms,), dtype=dtype)
         rho_edge = spline_lookup(density_tables, receiver_species, r, tables["dr"])
         density = zeros.at[senders].add(jnp.where(valid, rho_edge, zero), mode="promise_in_bounds")
-        z2 = spline_lookup(pair_tables, pair_index[sender_species, receiver_species],
+        z2 = spline_lookup(pair_tables, pair_table_id(sender_species, receiver_species),
                            r, tables["dr"])
         pair_term = jnp.where(valid, 0.5 * z2 / r, zero)
         if unique_boundary:
@@ -341,7 +349,6 @@ def make_setfl_edge_force(tables: dict, *, communicating: bool = False,
         embedding = jnp.asarray(tables["embedding"], dtype)
         density_tables = jnp.asarray(tables["density"], dtype)
         pair_tables = jnp.asarray(tables["pair"], dtype)
-        pair_index = jnp.asarray(tables["pair_index"])
         cutoff_sq = jnp.asarray(cutoff * cutoff, dtype)
         zero = jnp.asarray(0.0, dtype)
         one = jnp.asarray(1.0, dtype)
@@ -352,8 +359,10 @@ def make_setfl_edge_force(tables: dict, *, communicating: bool = False,
         r_sq = jnp.sum(rij * rij, axis=-1)
         valid = graph.edge_mask & (r_sq < cutoff_sq)
         r = jnp.sqrt(jnp.where(valid, r_sq, one))
-        sender_species = species.at[senders].get(mode="promise_in_bounds")
-        receiver_species = species.at[receivers].get(mode="promise_in_bounds")
+        # int8 per edge: XLA keeps these gathers in memory for their several consumers.
+        species8 = species.astype(jnp.int8)
+        sender_species = species8.at[senders].get(mode="promise_in_bounds")
+        receiver_species = species8.at[receivers].get(mode="promise_in_bounds")
 
         n_atoms = positions.shape[0]
         zeros = jnp.zeros((n_atoms,), dtype=dtype)
@@ -377,7 +386,7 @@ def make_setfl_edge_force(tables: dict, *, communicating: bool = False,
                               derivative=True)
         rhoip = spline_lookup(density_tables, sender_species, r, tables["dr"],
                               derivative=True)
-        pair_ids = pair_index[sender_species, receiver_species]
+        pair_ids = pair_table_id(sender_species, receiver_species)
         z2 = spline_lookup(pair_tables, pair_ids, r, tables["dr"])
         z2p = spline_lookup(pair_tables, pair_ids, r, tables["dr"], derivative=True)
         phi = z2 / r

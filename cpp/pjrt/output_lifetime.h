@@ -24,6 +24,7 @@ class OutputLifetime {
 
   // Stashes the force output of the latest execution for one consumer call.
   void retain_force_output(BufferPtr buffer, CUdeviceptr pointer);
+  PJRT_Buffer *pending_force_buffer() const { return pending_force_output_.get(); }
 
   // Invokes the consumer with the force pointer. Afterwards the buffer is
   // retired behind an event recorded on consumer_stream, even if the consumer

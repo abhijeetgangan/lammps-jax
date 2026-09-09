@@ -56,6 +56,8 @@ struct CommConfig {
   std::vector<int> widths;
   // Bytes per exchanged feature; f64 bundles exchange doubles.
   size_t elem_bytes = sizeof(float);
+  // Exchanges in the force, energy, and energy with forces programs; empty services until done.
+  std::vector<int> sites;
   // Services exchange requests on the engine's MPI thread.
   ModelComm::ServiceCallback callback;
 };
@@ -88,8 +90,16 @@ class Runtime {
   ModelComm *model_comm() const { return model_comm_.get(); }
 
  private:
-  ExecutionResult run_with_comm(const ExecutionRequest &request,
-                                const std::function<ExecutionResult()> &execute);
+  // Runs execute on the worker, servicing exchanges; returns once the outputs are retained,
+  // or once the execution completed when wait_result is set.
+  ExecutionResult run_on_worker(const ExecutionRequest &request,
+                                const std::function<ExecutionResult()> &execute,
+                                int expected_sites, bool wait_result);
+  int expected_sites(size_t program) const;
+  void mark_enqueued();
+  void mark_finished();
+  // Joins the deferred execution, surfacing its errors.
+  void settle();
   void worker_loop();
   void stop_worker();
 
@@ -100,6 +110,10 @@ class Runtime {
   std::packaged_task<ExecutionResult()> worker_task_;
   bool worker_has_task_ = false;
   bool worker_stop_ = false;
+  bool task_finished_ = true;
+  bool outputs_enqueued_ = false;
+  std::future<ExecutionResult> pending_;
+  std::vector<int> comm_sites_;
 
   PluginLibrary library_;
   ClientSession session_;

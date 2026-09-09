@@ -568,6 +568,7 @@ void PairJaxKokkos::coeff(int narg, char **arg)
       comm_config.max_atoms = bundle.contract.max_atoms;
       comm_config.widths = bundle.contract.comm_widths;
       comm_config.elem_bytes = comm_elem_bytes();
+      comm_config.sites = bundle.contract.comm_sites;
       comm_config.callback =
           [this](const pjrt::ModelCommRequest &request) { service_model_comm(request); };
     }

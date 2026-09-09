@@ -119,13 +119,13 @@ def abi_anchor(*values: jax.Array, dtype: Any = jnp.float32) -> jax.Array:
     """Keep fixed ABI inputs visible in exported StableHLO.
 
     JAX may prune unused arguments at export, but the native plugin always
-    supplies the full fixed ABI.
+    supplies the full fixed ABI. One element per input suffices.
     """
 
     anchor = jnp.zeros((), dtype=dtype)
     scale = jnp.finfo(dtype).tiny
     for value in values:
-        anchor += scale * jnp.sum(jax.lax.stop_gradient(jnp.asarray(value, dtype=dtype)))
+        anchor += scale * jax.lax.stop_gradient(jnp.asarray(value, dtype=dtype).reshape(-1)[0])
     return anchor
 
 
@@ -418,30 +418,39 @@ def export_model(
         r"tensor<\d+x(\d+)xf(?:32|64)>"
     )
 
-    def check_exchange_widths(exported: Any) -> None:
+    def check_exchange_widths(exported: Any) -> int:
+        """Check lowered exchange widths against the schedule; return the exchange count."""
         if not comm_widths:
-            return
+            return 0
         allowed = set(comm_widths)
+        sites = 0
         for line in exported.mlir_module().splitlines():
             match = exchange_width.search(line)
-            if match and int(match.group(1)) not in allowed:
+            if not match:
+                continue
+            sites += 1
+            if int(match.group(1)) not in allowed:
                 raise ValueError(
                     f"lowered exchange width {match.group(1)} is not in the "
                     f"recorded schedule {sorted(allowed)}; exchanges under "
                     "jax.vmap fold the batch into the width and cannot honor "
                     "the bundle schedule"
                 )
+        return sites
 
     # Portable VHLO bytecode; PJRT's mlir format auto-detects it.
+    comm_sites: list[int] = []
+
     def export_mlir(fn: Callable[..., Any] | None) -> str:
         if fn is None:
+            comm_sites.append(0)
             return ""
         # Highest matmul precision: TF32 dot_generals would soften forces.
         with jax.default_matmul_precision("highest"):
             exported = jax.export.export(fn, platforms=("cuda",), disabled_checks=disabled_checks)(  # ty: ignore[invalid-argument-type]
                 *args
             )
-        check_exchange_widths(exported)
+        comm_sites.append(check_exchange_widths(exported))
         return base64.b64encode(exported.mlir_module_serialized).decode("ascii")
 
     from jaxlib import xla_client
@@ -479,6 +488,8 @@ def export_model(
             "edge_pairing": ("half-unique" if unique_boundary
                              else "half" if half_edges else "full"),
             "comm_widths": list(comm_widths),
+            # Exchange count of each program in export order; servicing stops after that many.
+            "comm_sites": comm_sites,
             # "__gpu$" handlers ship in the plugin; recording them would demand a mapping.
             "custom_call_targets": sorted(
                 target for target in custom_call_targets

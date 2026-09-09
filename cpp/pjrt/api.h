@@ -27,9 +27,19 @@ struct PJRT_Get_Stream_For_External_Ready_Events_Args_Local {
 using PJRT_Get_Stream_For_External_Ready_Events_Fn_Local =
     PJRT_Error *(*)(PJRT_Get_Stream_For_External_Ready_Events_Args_Local *args);
 
+struct PJRT_Wait_Until_Buffer_Ready_On_Stream_Args_Local {
+  size_t struct_size;
+  intptr_t stream;
+  PJRT_Buffer *buffer;
+};
+
+using PJRT_Wait_Until_Buffer_Ready_On_Stream_Fn_Local =
+    PJRT_Error *(*)(PJRT_Wait_Until_Buffer_Ready_On_Stream_Args_Local *args);
+
 struct PJRT_Stream_Extension_Local {
   PJRT_Extension_Base base;
   PJRT_Get_Stream_For_External_Ready_Events_Fn_Local get_stream;
+  PJRT_Wait_Until_Buffer_Ready_On_Stream_Fn_Local wait_stream;
 };
 
 } // namespace pjrt

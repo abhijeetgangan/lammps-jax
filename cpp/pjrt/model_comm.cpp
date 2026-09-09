@@ -280,12 +280,14 @@ void ModelComm::begin_step(int nlocal, int nghost)
   nghost_ = nghost;
 }
 
-void ModelComm::begin_service()
+void ModelComm::begin_service(int expected_requests)
 {
   std::lock_guard<std::mutex> lock(mutex_);
   servicing_ = true;
   done_ = false;
   request_pending_ = false;
+  expected_requests_ = expected_requests;
+  serviced_requests_ = 0;
   service_error_.clear();
   forward_site_ = 0;
   reverse_site_ = 0;
@@ -302,6 +304,8 @@ void ModelComm::service_loop()
 {
   std::unique_lock<std::mutex> lock(mutex_);
   for (;;) {
+    // A known request count lets the caller leave before the program completes.
+    if (expected_requests_ >= 0 && serviced_requests_ >= expected_requests_) break;
     condition_.wait(lock, [&] { return request_pending_ || done_; });
     if (request_pending_) {
       const ModelCommRequest request = request_;
@@ -323,6 +327,7 @@ void ModelComm::service_loop()
       lock.lock();
       service_error_ = error;
       request_pending_ = false;
+      ++serviced_requests_;
       condition_.notify_all();
     }
     if (done_ && !request_pending_) break;

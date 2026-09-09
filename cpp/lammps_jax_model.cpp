@@ -231,6 +231,7 @@ ModelBundle load_bundle_file(const std::string &path)
   bundle.contract.newton = parse_newton_mode(get_string(json, "newton"));
   bundle.contract.n_hops = get_int_or(json, "n_hops", 1);
   bundle.contract.comm_widths = get_int_array_or(json, "comm_widths");
+  bundle.contract.comm_sites = get_int_array_or(json, "comm_sites");
   bundle.contract.custom_call_targets = get_string_array_or(json, "custom_call_targets");
   bundle.contract.uses_box = get_bool(json, "uses_box");
   bundle.contract.pair_sum = get_bool_or(json, "pair_sum", false);

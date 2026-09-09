@@ -147,7 +147,8 @@ ExecutionResult execute_loaded(const PluginLibrary &library, PJRT_Client *client
                                PJRT_LoadedExecutable *executable,
                                const ExecutionRequest &request, bool with_energy,
                                bool with_forces, OutputLifetime &output_lifetime,
-                               PJRT_ExecuteContext *execute_context = nullptr)
+                               PJRT_ExecuteContext *execute_context = nullptr,
+                               std::function<void()> on_enqueued = {})
 {
   // Fused programs return energy and forces, single-purpose one; arity checked at compile.
   const size_t num_outputs = static_cast<size_t>(with_energy) + static_cast<size_t>(with_forces);
@@ -203,19 +204,11 @@ ExecutionResult execute_loaded(const PluginLibrary &library, PJRT_Client *client
   library.check(api->PJRT_LoadedExecutable_Execute(&execute_args),
                 "PJRT_LoadedExecutable_Execute");
 
-  // Adopt outputs before the await: on the GPU client execution failures
-  // arrive through the completion event after the buffers already exist.
+  // Outputs exist before completion: adopt and retain them, announce, then await;
+  // execution failures arrive through the completion event.
   std::vector<BufferPtr> outputs;
   outputs.reserve(num_outputs);
   for (PJRT_Buffer *buffer : output_buffers) outputs.emplace_back(buffer, BufferDeleter{api});
-
-  EventPtr complete(complete_event, EventDeleter{api});
-  if (complete) {
-    PJRT_Event_Await_Args await_args{};
-    await_args.struct_size = PJRT_Event_Await_Args_STRUCT_SIZE;
-    await_args.event = complete.get();
-    library.check(api->PJRT_Event_Await(&await_args), "PJRT_Event_Await");
-  }
 
   for (const BufferPtr &output : outputs)
     if (!output) throw std::runtime_error("PJRT returned a null output buffer");
@@ -230,6 +223,20 @@ ExecutionResult execute_loaded(const PluginLibrary &library, PJRT_Client *client
           "PJRT program output element type " + std::to_string(actual_type) +
           " does not match the bundle precision (expected PJRT_Buffer_Type " +
           std::to_string(expected_type) + (f64 ? ", float64)" : ", float32)"));
+  }
+
+  if (force_output_index >= 0) {
+    const CUdeviceptr force_pointer = output_pointer(library, outputs[force_output_index].get());
+    output_lifetime.retain_force_output(std::move(outputs[force_output_index]), force_pointer);
+  }
+  if (on_enqueued) on_enqueued();
+
+  EventPtr complete(complete_event, EventDeleter{api});
+  if (complete) {
+    PJRT_Event_Await_Args await_args{};
+    await_args.struct_size = PJRT_Event_Await_Args_STRUCT_SIZE;
+    await_args.event = complete.get();
+    library.check(api->PJRT_Event_Await(&await_args), "PJRT_Event_Await");
   }
 
   if (energy_output_index >= 0) {
@@ -250,10 +257,6 @@ ExecutionResult execute_loaded(const PluginLibrary &library, PJRT_Client *client
     }
   }
 
-  if (force_output_index >= 0) {
-    const CUdeviceptr force_pointer = output_pointer(library, outputs[force_output_index].get());
-    output_lifetime.retain_force_output(std::move(outputs[force_output_index]), force_pointer);
-  }
   return result;
 }
 
@@ -269,6 +272,11 @@ Runtime::~Runtime()
 
 void Runtime::close()
 {
+  // Shutdown ignores a failed last step; the buffers must still outlive the execution.
+  try {
+    settle();
+  } catch (...) {
+  }
   stop_worker();
   if (model_comm_) {
     model_comm_->close(library_.api());
@@ -289,6 +297,8 @@ void Runtime::initialize(const std::string &plugin_path, const std::string &forc
                          const std::vector<std::string> &custom_call_targets)
 {
   close();
+  // The force pointer is read before completion, which needs PJRT's synchronous dispatch.
+  unsetenv("PJRT_GPU_ENABLE_ASYNC_DISPATCH");
   // Command buffers replay programs as CUDA graphs, worth 6%; prepended so user flags still win.
   {
     const std::string defaults =
@@ -309,6 +319,7 @@ void Runtime::initialize(const std::string &plugin_path, const std::string &forc
   session_.initialize(library_, client_options);
   // Handler registration must precede compiling programs that reference those targets.
   register_external_ffi_handlers(library_, custom_call_targets);
+  comm_sites_ = comm_config.sites;
   if (!comm_config.widths.empty()) {
     model_comm_ = std::make_unique<ModelComm>();
     model_comm_->initialize(library_.api(), comm_config.max_atoms, comm_config.widths,
@@ -324,25 +335,34 @@ void Runtime::initialize(const std::string &plugin_path, const std::string &forc
                                              "energy+forces", 2);
 }
 
-ExecutionResult Runtime::run_with_comm(const ExecutionRequest &request,
-                                       const std::function<ExecutionResult()> &execute)
+ExecutionResult Runtime::run_on_worker(const ExecutionRequest &request,
+                                       const std::function<ExecutionResult()> &execute,
+                                       int expected_sites, bool wait_result)
 {
-  if (!model_comm_) return execute();
-  model_comm_->begin_step(request.nlocal, request.nghost);
-  // Handlers block until this MPI thread services them; execution runs on a worker meanwhile.
-  model_comm_->begin_service();
+  settle();
   ModelComm *model_comm = model_comm_.get();
+  if (model_comm) {
+    model_comm->begin_step(request.nlocal, request.nghost);
+    // Handlers block until this MPI thread services them; execution runs on the worker meanwhile.
+    model_comm->begin_service(expected_sites);
+  }
   // The worker starts without a CUDA context; adopt the caller's for the driver-API calls.
   CUcontext cuda_context = nullptr;
   cuCtxGetCurrent(&cuda_context);
-  std::packaged_task<ExecutionResult()> task([model_comm, &execute, cuda_context]() {
-    // Guard first: a throw before mark_execution_done wedges service_loop.
+  std::packaged_task<ExecutionResult()> task([this, model_comm, execute, cuda_context]() {
+    // Guard first: a throw before the marks would wedge service_loop and the caller's wait.
+    // Marking inside the task orders it before the future becomes ready.
     struct DoneGuard {
-      ModelComm *owner;
-      ~DoneGuard() { owner->mark_execution_done(); }
-    } guard{model_comm};
+      Runtime *runtime;
+      ModelComm *comm;
+      ~DoneGuard()
+      {
+        if (comm) comm->mark_execution_done();
+        runtime->mark_finished();
+      }
+    } guard{this, model_comm};
     if (cuda_context != nullptr)
-      check_cuda(cuCtxSetCurrent(cuda_context), "adopt CUDA context on model comm worker");
+      check_cuda(cuCtxSetCurrent(cuda_context), "adopt CUDA context on the execution worker");
     return execute();
   });
   auto future = task.get_future();
@@ -351,10 +371,50 @@ ExecutionResult Runtime::run_with_comm(const ExecutionRequest &request,
     if (!worker_.joinable()) worker_ = std::thread([this] { worker_loop(); });
     worker_task_ = std::move(task);
     worker_has_task_ = true;
+    task_finished_ = false;
+    outputs_enqueued_ = false;
   }
   worker_cv_.notify_one();
-  model_comm_->service_loop();
-  return future.get();
+  if (model_comm) model_comm->service_loop();
+  {
+    std::unique_lock<std::mutex> lock(worker_mutex_);
+    worker_cv_.wait(lock, [this] { return outputs_enqueued_ || task_finished_; });
+    if (wait_result || !outputs_enqueued_) {
+      lock.unlock();
+      return future.get();
+    }
+  }
+  // Completion is awaited on the worker; the next execution or close() joins it.
+  pending_ = std::move(future);
+  return {};
+}
+
+void Runtime::mark_enqueued()
+{
+  {
+    std::lock_guard<std::mutex> lock(worker_mutex_);
+    outputs_enqueued_ = true;
+  }
+  worker_cv_.notify_all();
+}
+
+void Runtime::mark_finished()
+{
+  {
+    std::lock_guard<std::mutex> lock(worker_mutex_);
+    task_finished_ = true;
+  }
+  worker_cv_.notify_all();
+}
+
+void Runtime::settle()
+{
+  if (pending_.valid()) pending_.get();
+}
+
+int Runtime::expected_sites(size_t program) const
+{
+  return program < comm_sites_.size() ? comm_sites_[program] : -1;
 }
 
 void Runtime::worker_loop()
@@ -385,37 +445,43 @@ void Runtime::stop_worker()
 
 ExecutionResult Runtime::execute_force(const ExecutionRequest &request)
 {
-  return run_with_comm(request, [&] {
+  // Force-only steps return once the output is retained; comm bundles need the exchange count.
+  const int sites = expected_sites(0);
+  return run_on_worker(request, [&] {
     return execute_loaded(library_, session_.client(), session_.device(),
                           session_.input_stream_for(library_), force_executable_.get(),
                           request, false, true, output_lifetime_,
-                          model_comm_ ? model_comm_->execute_context() : nullptr);
-  });
+                          model_comm_ ? model_comm_->execute_context() : nullptr,
+                          [this] { mark_enqueued(); });
+  }, sites, model_comm_ && sites < 0);
 }
 
 ExecutionResult Runtime::execute_energy(const ExecutionRequest &request)
 {
-  return run_with_comm(request, [&] {
+  return run_on_worker(request, [&] {
     return execute_loaded(library_, session_.client(), session_.device(),
                           session_.input_stream_for(library_), energy_executable_.get(),
                           request, true, false, output_lifetime_,
                           model_comm_ ? model_comm_->execute_context() : nullptr);
-  });
+  }, expected_sites(1), true);
 }
 
 ExecutionResult Runtime::execute_energy_force(const ExecutionRequest &request)
 {
-  return run_with_comm(request, [&] {
+  return run_on_worker(request, [&] {
     return execute_loaded(library_, session_.client(), session_.device(),
                           session_.input_stream_for(library_), energy_force_executable_.get(),
                           request, true, true, output_lifetime_,
                           model_comm_ ? model_comm_->execute_context() : nullptr);
-  });
+  }, expected_sites(2), true);
 }
 
 void Runtime::consume_force_output(CUstream consumer_stream,
                                    const std::function<void(CUdeviceptr)> &consumer)
 {
+  // The consumer stream waits on device for the defining execution; no host round trip.
+  if (PJRT_Buffer *buffer = output_lifetime_.pending_force_buffer())
+    session_.wait_until_ready(library_, buffer, consumer_stream);
   output_lifetime_.consume_force_output(consumer_stream, consumer);
 }
 

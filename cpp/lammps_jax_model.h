@@ -52,6 +52,8 @@ struct ModelContract {
   bool half_edges = false;
   // Feature width of each exchange in forward order; ModelComm validates. Empty: non-communicating.
   std::vector<int> comm_widths;
+  // Exchanges in the force, energy, and energy with forces programs; servicing ends after them.
+  std::vector<int> comm_sites;
   // External FFI custom-call targets; handlers register via LAMMPS_JAX_FFI_HANDLERS before compile.
   std::vector<std::string> custom_call_targets;
   // Model takes the cell as a trailing [3,3] row-vector matrix at the contract precision.
