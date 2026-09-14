@@ -141,10 +141,10 @@ bool get_bool_or(const std::string &json, const std::string &key, bool fallback)
   return get_bool(json, key);
 }
 
-// Validation only: the sole supported layout needs no runtime representation.
-void parse_input_layout(const std::string &value)
+InputLayout parse_input_layout(const std::string &value)
 {
-  if (value == "sparse-edge") return;
+  if (value == "sparse-edge") return InputLayout::SparseEdge;
+  if (value == "neighbor-matrix") return InputLayout::NeighborMatrix;
   throw std::runtime_error("Unsupported LAMMPS-JAX input layout '" + value +
                            "'; re-export the bundle with the current lammps_jax exporter");
 }
@@ -221,9 +221,10 @@ ModelBundle load_bundle_file(const std::string &path)
   bundle.programs.energy_and_forces_mlir = get_program(json, "energy_and_forces_mlir");
   bundle.compile_options = decode_base64(get_string(json, "compile_options_b64"));
   // Sorted keys put "contract" before the program blobs; first-match lookup never reads them.
-  parse_input_layout(get_string(json, "input_layout"));
+  bundle.contract.input_layout = parse_input_layout(get_string(json, "input_layout"));
   bundle.contract.max_atoms = static_cast<int>(get_number(json, "max_atoms"));
-  bundle.contract.max_edges = static_cast<int>(get_number(json, "max_edges"));
+  bundle.contract.max_edges = get_int_or(json, "max_edges", 0);
+  bundle.contract.max_neighbors = get_int_or(json, "max_neighbors", 0);
   bundle.contract.cutoff = get_number(json, "cutoff");
   bundle.contract.unit_style = get_string(json, "unit_style");
   bundle.contract.precision = parse_precision(get_string(json, "precision"));
@@ -269,8 +270,22 @@ ModelBundle load_bundle_file(const std::string &path)
     throw std::runtime_error(
         "Half-edge bundles require n_hops > 1 or a communication schedule; the "
         "single-hop packer does not deduplicate edge directions");
-  if (bundle.contract.max_atoms <= 0 || bundle.contract.max_edges <= 0)
+  const bool matrix = bundle.contract.input_layout == InputLayout::NeighborMatrix;
+  if (bundle.contract.max_atoms <= 0 ||
+      (matrix ? bundle.contract.max_neighbors : bundle.contract.max_edges) <= 0)
     throw std::runtime_error("Invalid fixed capacities in bundle");
+  if (matrix && bundle.contract.force_layout == ForceLayout::Edge)
+    throw std::runtime_error(
+        "Neighbor-matrix bundles return per-atom forces; edge-force output needs sparse edges");
+  if (bundle.contract.max_owned > 0 && bundle.contract.comm_widths.empty() &&
+      !(matrix && bundle.contract.n_hops == 1))
+    throw std::runtime_error(
+        "max_owned needs a communicating or single-hop neighbor-matrix bundle; other layouts "
+        "hold ghost rows past the owned ones");
+  if (matrix && bundle.contract.half_edges && bundle.contract.comm_widths.empty())
+    throw std::runtime_error(
+        "Neighbor-matrix half pairing needs a communication schedule; the pair style hands "
+        "the model the LAMMPS half list as is");
   if (bundle.contract.n_hops < 1) throw std::runtime_error("Invalid n_hops in bundle");
   if (bundle.contract.n_hops > 1 &&
       (bundle.contract.newton != NewtonMode::On || bundle.contract.force_layout != ForceLayout::Atom))
@@ -279,11 +294,15 @@ ModelBundle load_bundle_file(const std::string &path)
         "must flow back through the LAMMPS reverse communication");
   for (const int width : bundle.contract.comm_widths)
     if (width <= 0) throw std::runtime_error("Invalid communication width in bundle");
-  if (!bundle.contract.comm_widths.empty() &&
-      (bundle.contract.newton != NewtonMode::On || bundle.contract.n_hops != 1))
+  if (!bundle.contract.comm_widths.empty() && bundle.contract.n_hops != 1)
     throw std::runtime_error(
-        "Communicating bundles require newton on and a one-cutoff ghost shell "
-        "(n_hops = 1)");
+        "Communicating bundles require a one-cutoff ghost shell (n_hops = 1)");
+  // Full-pairing atom forces land on owned rows only, which newton off adds without ghost rows.
+  if (!bundle.contract.comm_widths.empty() && bundle.contract.newton != NewtonMode::On &&
+      (bundle.contract.half_edges || bundle.contract.force_layout != ForceLayout::Atom))
+    throw std::runtime_error(
+        "Communicating bundles require newton on unless they pair fully and return atom "
+        "forces; ghost force rows flow back through the LAMMPS reverse communication");
   if (!bundle.contract.comm_widths.empty() &&
       bundle.contract.force_layout == ForceLayout::Edge && !bundle.contract.half_edges)
     throw std::runtime_error(

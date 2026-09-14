@@ -120,6 +120,43 @@ struct PackNeighborFunctor {
   }
 };
 
+// Column i of the [max_neighbors, rows] matrix is atom i's list; unused slots hold max_atoms.
+template <class DeviceType>
+struct CopyNeighborMatrixFunctor {
+  NeighListKokkos<DeviceType> list;
+  Kokkos::View<int **, Kokkos::LayoutRight, DeviceType> neighbors_out;
+  Kokkos::View<int *, DeviceType> num_neighbors_out;
+  Kokkos::View<int, DeviceType> widest_row;
+  Kokkos::View<int, DeviceType> overflow;
+  int max_atoms;
+  int max_neighbors;
+  int rows;
+  int num_rows;
+
+  ~CopyNeighborMatrixFunctor() { list.copymode = 1; }
+
+  KOKKOS_INLINE_FUNCTION
+  void operator()(const int flat) const
+  {
+    // Atom-fastest on both sides: the list is LayoutLeft, so a warp reads and writes contiguously.
+    const int s = flat / rows;
+    const int i = flat % rows;
+    if (i >= num_rows) {
+      neighbors_out(s, i) = max_atoms;
+      if (s == 0) num_neighbors_out(i) = 0;
+      return;
+    }
+    const int n = list.d_numneigh(i);
+    if (s == 0) {
+      Kokkos::atomic_max(&widest_row(), n);
+      if (n > max_neighbors) overflow() = 1;
+      num_neighbors_out(i) = n < max_neighbors ? n : max_neighbors;
+    }
+    const int j = s < n ? (list.d_neighbors(i, s) & NEIGHMASK) : max_atoms;
+    neighbors_out(s, i) = j < max_atoms ? j : max_atoms;
+  }
+};
+
 // Slots past the new count still hold last step's edges; restore the padding there.
 struct ResetEdgeTailFunctor {
   Kokkos::View<int *, LMPDeviceType> senders;
@@ -340,12 +377,23 @@ void PairJaxKokkos::allocate_device_buffers()
   d_edge_overflow = scalar_int_view("lammps_jax_edge_overflow");
   h_edge_count = scalar_int_pinned_view("lammps_jax_edge_count_host");
   h_edge_overflow = scalar_int_pinned_view("lammps_jax_edge_overflow_host");
-  d_senders = int_view("lammps_jax_senders", max_edges);
-  d_receivers = int_view("lammps_jax_receivers", max_edges);
-  d_edge_mask = bool_view("lammps_jax_edge_mask", max_edges);
   // Padding contract: unpacked slots index past the atom rows; the pack keeps it per step.
-  Kokkos::deep_copy(d_senders, max_atoms);
-  Kokkos::deep_copy(d_receivers, max_atoms);
+  if (matrix_layout()) {
+    if (static_cast<long long>(matrix_rows()) * bundle.contract.max_neighbors >
+        static_cast<long long>(std::numeric_limits<int>::max()))
+      throw std::runtime_error("neighbor matrix rows times max_neighbors exceeds the int "
+                               "range; lower max_owned, max_atoms, or max_neighbors");
+    d_neighbors = neighbor_view("lammps_jax_neighbors", bundle.contract.max_neighbors,
+                                matrix_rows());
+    d_num_neighbors = int_view("lammps_jax_num_neighbors", matrix_rows());
+    Kokkos::deep_copy(d_neighbors, max_atoms);
+  } else {
+    d_senders = int_view("lammps_jax_senders", max_edges);
+    d_receivers = int_view("lammps_jax_receivers", max_edges);
+    d_edge_mask = bool_view("lammps_jax_edge_mask", max_edges);
+    Kokkos::deep_copy(d_senders, max_atoms);
+    Kokkos::deep_copy(d_receivers, max_atoms);
+  }
   // Rank-local failure: the throw reaches coeff()'s catch, which error->one's.
   if (input_ready_event == nullptr &&
       cuEventCreate(&input_ready_event, CU_EVENT_DISABLE_TIMING) != CUDA_SUCCESS)
@@ -386,7 +434,18 @@ bool PairJaxKokkos::half_list() const
 {
   if (!force->newton_pair) return false;
   if (comm_enabled()) return bundle.contract.half_edges;
+  if (matrix_layout()) return false;
   return bundle.contract.n_hops == 1 && (edge_force_enabled() || bundle.contract.pair_sum);
+}
+
+bool PairJaxKokkos::matrix_layout() const
+{
+  return bundle.contract.input_layout == lammps_jax::InputLayout::NeighborMatrix;
+}
+
+int PairJaxKokkos::matrix_rows() const
+{
+  return bundle.contract.max_owned > 0 ? bundle.contract.max_owned : bundle.contract.max_atoms;
 }
 
 // Runs on the LAMMPS MPI thread while execution waits in the FFI handler.
@@ -760,8 +819,27 @@ void PairJaxKokkos::pack_edges(NeighListKokkos<PairJaxKokkos::device_type> *klis
     // The collective capacity check errors this step; the clamp bounds the flat index.
     const int num_rows = std::min(klist->inum + (multi_hop ? klist->gnum : 0),
                                   bundle.contract.max_atoms);
-    const long long flat_extent =
-        static_cast<long long>(num_rows) * max_neighbors_per_atom;
+    if (matrix_layout()) {
+      // Row i is atom i, which holds for every native Kokkos list but not pair hybrid skip lists.
+      const int list_rows = klist->inum + (multi_hop ? klist->gnum : 0);
+      const int owned_rows = neighbor->includegroup ? atom->nfirst : atom->nlocal;
+      if (list_rows != (multi_hop ? atom->nlocal + atom->nghost : owned_rows))
+        error->one(FLERR,
+                   "LAMMPS-JAX neighbor-matrix bundles need a list over every atom; pair "
+                   "hybrid skip lists are unsupported");
+      // The list is copied as is; the model masks skin pairs, so no repack until the next build.
+      Kokkos::parallel_for(
+          "LAMMPSJAX::copy_neighbor_matrix",
+          Kokkos::RangePolicy<LMPDeviceType>(exec, 0,
+                                             matrix_rows() * bundle.contract.max_neighbors),
+          CopyNeighborMatrixFunctor<LMPDeviceType>{*klist, d_neighbors, d_num_neighbors,
+                                                   d_edge_count, d_edge_overflow,
+                                                   bundle.contract.max_atoms,
+                                                   bundle.contract.max_neighbors, matrix_rows(),
+                                                   std::min(num_rows, matrix_rows())});
+      return;
+    }
+    const long long flat_extent = static_cast<long long>(num_rows) * max_neighbors_per_atom;
     if (flat_extent > static_cast<long long>(std::numeric_limits<int>::max()))
       error->one(FLERR,
                  "LAMMPS-JAX neighbor pack index overflows int; reduce the bundle "
@@ -850,13 +928,22 @@ pjrt::ExecutionRequest PairJaxKokkos::make_request_as(CUstream stream, CUevent r
        pjrt::ElementType::S32},
       {"nlocal", reinterpret_cast<CUdeviceptr>(d_nlocal.data()), {}, pjrt::ElementType::S32},
       {"nghost", reinterpret_cast<CUdeviceptr>(d_nghost.data()), {}, pjrt::ElementType::S32},
-      {"senders", reinterpret_cast<CUdeviceptr>(d_senders.data()), {bundle.contract.max_edges},
-       pjrt::ElementType::S32},
-      {"receivers", reinterpret_cast<CUdeviceptr>(d_receivers.data()), {bundle.contract.max_edges},
-       pjrt::ElementType::S32},
-      {"edge_mask", reinterpret_cast<CUdeviceptr>(d_edge_mask.data()), {bundle.contract.max_edges},
-       pjrt::ElementType::Pred},
   };
+  if (matrix_layout()) {
+    request.inputs.push_back({"neighbors", reinterpret_cast<CUdeviceptr>(d_neighbors.data()),
+                              {bundle.contract.max_neighbors, matrix_rows()},
+                              pjrt::ElementType::S32});
+    request.inputs.push_back({"num_neighbors",
+                              reinterpret_cast<CUdeviceptr>(d_num_neighbors.data()),
+                              {matrix_rows()}, pjrt::ElementType::S32});
+  } else {
+    request.inputs.push_back({"senders", reinterpret_cast<CUdeviceptr>(d_senders.data()),
+                              {bundle.contract.max_edges}, pjrt::ElementType::S32});
+    request.inputs.push_back({"receivers", reinterpret_cast<CUdeviceptr>(d_receivers.data()),
+                              {bundle.contract.max_edges}, pjrt::ElementType::S32});
+    request.inputs.push_back({"edge_mask", reinterpret_cast<CUdeviceptr>(d_edge_mask.data()),
+                              {bundle.contract.max_edges}, pjrt::ElementType::Pred});
+  }
   if (bundle.contract.uses_box) {
     const CUdeviceptr box_pointer = reinterpret_cast<CUdeviceptr>(views.box.data());
     request.inputs.emplace_back("box", box_pointer, std::vector<int64_t>{3, 3}, real_type);
@@ -920,8 +1007,8 @@ void PairJaxKokkos::compute(int eflag, int vflag)
 
   auto *klist = dynamic_cast<NeighListKokkos<LMPDeviceType> *>(list);
   if (klist == nullptr) error->all(FLERR, "LAMMPS-JAX requires a Kokkos device neighbor list");
-  // Edges are cutoff-filtered against current positions, so repack every step.
-  const bool rebuild_edges = true;
+  // Edges are cutoff-filtered so they repack every step; the matrix follows the list rebuilds.
+  const bool rebuild_edges = !matrix_layout() || neighbor->ago == 0;
 
   atomKK->sync(execution_space, datamask_read);
   atomKK->modified(execution_space, datamask_modify);
@@ -979,10 +1066,18 @@ void PairJaxKokkos::compute(int eflag, int vflag)
     const int local_counts[2] = {h_edge_count(), h_edge_overflow()};
     int global_counts[2] = {local_counts[0], local_counts[1]};
     MPI_Allreduce(local_counts, global_counts, 2, MPI_INT, MPI_MAX, world);
+    if (global_counts[1] && matrix_layout())
+      error->all(FLERR,
+                 "LAMMPS-JAX neighbor capacity exceeded: global max {} neighbors per atom, "
+                 "capacity {}", global_counts[0], bundle.contract.max_neighbors);
     if (global_counts[1])
       error->all(FLERR, "LAMMPS-JAX edge capacity exceeded: global max {} edges, capacity {}",
                  global_counts[0], bundle.contract.max_edges);
-    cached_edge_count = local_counts[0];
+    // Once per run: the widest row tells users how tight max_neighbors can be exported.
+    if (matrix_layout() && comm->me == 0 && update->ntimestep == update->firststep)
+      utils::logmesg(lmp, "LAMMPS-JAX: widest neighbor row uses {} of {} matrix slots\n",
+                     global_counts[0], bundle.contract.max_neighbors);
+    if (!matrix_layout()) cached_edge_count = local_counts[0];
   }
 
   if (include_energy) eng_vdwl += scale * result.energy;

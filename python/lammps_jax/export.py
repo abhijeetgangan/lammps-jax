@@ -1,8 +1,10 @@
 """Export JAX energy or force callables as fixed-capacity VHLO bundles for pair_style jax/kk.
 
-Padding edges carry senders = receivers = max_atoms with edge_mask false. Index with
-mode="promise_in_bounds": XLA clamps the gathers and drops the scatters without mask
-arrays, so mask every edge term with edge_mask and guard divisions or the gradient goes NaN.
+Graphs arrive either as sparse edges (senders, receivers, edge_mask) or as a slot-major neighbor
+matrix holding the LAMMPS list itself, one column per listed atom with its row count alongside.
+Padding indexes max_atoms (edge_mask false on edges). Index with mode="promise_in_bounds": XLA
+clamps the gathers and drops the scatters without mask arrays, so mask every pair term and guard
+divisions or the gradient goes NaN.
 """
 
 import base64
@@ -22,7 +24,8 @@ BUNDLE_FORMAT = "lammps-jax-json"
 DISTRIBUTED_BUNDLE_FORMAT = "lammps-jax-json-distributed"
 # Each pair packed once; a loader packing both directions double counts.
 HALF_EDGE_BUNDLE_FORMAT = "lammps-jax-json-half-edge"
-INPUT_LAYOUT = "sparse-edge"
+SPARSE_EDGE_LAYOUT = "sparse-edge"
+NEIGHBOR_MATRIX_LAYOUT = "neighbor-matrix"
 ATOM_FORCE = "atom-force"
 EDGE_FORCE = "edge-force"
 FORCE_OUTPUTS = {ATOM_FORCE, EDGE_FORCE}
@@ -36,6 +39,24 @@ class LammpsNeighborList(NamedTuple):
     senders: jax.Array
     receivers: jax.Array
     edge_mask: jax.Array
+
+
+class LammpsNeighborMatrix(NamedTuple):
+    """The LAMMPS list as [max_neighbors, rows] int32, slots filled from 0, padding max_atoms."""
+
+    neighbors: jax.Array
+    num_neighbors: jax.Array
+
+
+Graph = LammpsNeighborList | LammpsNeighborMatrix
+
+
+def has_ghost_rows(graph: Graph, nlocal: Any) -> jax.Array:
+    """True when a valid pair starts on a ghost row; single-hop matrices hold owned rows only."""
+    if isinstance(graph, LammpsNeighborMatrix):
+        rows = jnp.arange(graph.num_neighbors.shape[0])
+        return jnp.any((graph.num_neighbors > 0) & (rows >= nlocal))
+    return jnp.any(graph.edge_mask & (graph.senders >= nlocal))
 
 
 def program_text(bundle: dict[str, Any], program: str) -> str:
@@ -133,7 +154,7 @@ def wrap_energy_fn(
     energy_fn: Callable[..., Any],
     *,
     max_atoms: int,
-    call_model: Callable[[Callable[..., Any], tuple[Any, ...]], tuple[Any, LammpsNeighborList, Any, Any]],
+    call_model: Callable[[Callable[..., Any], tuple[Any, ...]], tuple[Any, Graph, Any, Any]],
     owned_rows_only: bool = False,
     dtype: Any = jnp.float32,
 ) -> tuple[Callable[..., Any], Callable[..., Any], Callable[..., Any]]:
@@ -170,8 +191,7 @@ def wrap_energy_fn(
             # Ghost rows duplicate neighbor-rank energies; count owned only.
             energy = local_energy
         else:
-            has_ghost_sender = jnp.any(graph.edge_mask & (graph.senders >= nlocal))
-            energy = jnp.where(has_ghost_sender, total_energy, local_energy)
+            energy = jnp.where(has_ghost_rows(graph, nlocal), total_energy, local_energy)
         return energy + abi_anchor(*args, dtype=dtype)
 
     def export_energy_and_forces(*args: Any) -> tuple[jax.Array, jax.Array]:
@@ -195,7 +215,8 @@ def export_model(
     force_fn: Callable[..., Any] | None = None,
     path: str | Path,
     max_atoms: int,
-    max_edges: int,
+    max_edges: int | None = None,
+    max_neighbors: int | None = None,
     cutoff: float,
     unit_style: str = "real",
     precision: str = PRECISION,
@@ -210,21 +231,35 @@ def export_model(
     max_owned: int | None = None,
     pair_sum: bool = False,
 ) -> dict[str, Any]:
-    """Export a JAX model to a fixed-capacity sparse LAMMPS-JAX JSON bundle.
+    """Export a JAX model to a fixed-capacity LAMMPS-JAX JSON bundle.
 
     Provide either energy_fn or force_fn; forces from an energy export are
-    the negative position gradient of the summed energy.
+    the negative position gradient of the summed energy. max_edges selects the
+    sparse edge layout, max_neighbors the slot-major neighbor matrix with that
+    many slots per row; rows are max_owned when given, else max_atoms.
     """
     if energy_fn is None and force_fn is None:
         raise ValueError("provide energy_fn or force_fn")
     if max_atoms <= 0:
         raise ValueError("max_atoms must be positive")
-    if max_edges <= 0:
+    if (max_edges is None) == (max_neighbors is None):
+        raise ValueError("give exactly one of max_edges (sparse edges) or max_neighbors "
+                         "(neighbor matrix)")
+    if max_edges is not None and max_edges <= 0:
         raise ValueError("max_edges must be positive")
+    if max_neighbors is not None and max_neighbors <= 0:
+        raise ValueError("max_neighbors must be positive")
     if cutoff < 0:
         raise ValueError("cutoff must be non-negative")
     if force_output not in FORCE_OUTPUTS:
         raise ValueError(f"force_output must be one of {sorted(FORCE_OUTPUTS)}")
+    matrix = max_neighbors is not None
+    if matrix and force_output == EDGE_FORCE:
+        raise ValueError("edge-force output needs the sparse edge layout; neighbor-matrix "
+                         "models return per-atom forces")
+    if matrix and half_edges and not comm:
+        raise ValueError("neighbor-matrix half pairing needs a communicating export; the pair "
+                         "style hands the model the LAMMPS half list as is")
     if newton not in {"on", "off", "any"}:
         raise ValueError("newton must be 'on', 'off', or 'any'")
     if precision not in PRECISIONS:
@@ -246,11 +281,13 @@ def export_model(
             "force contributions of a direct force_fn have no defined convention"
         )
     if comm:
-        if force_fn is not None and force_output != EDGE_FORCE:
+        if (force_fn is not None and force_output != EDGE_FORCE and not half_edges
+                and newton != "off"):
             raise ValueError(
-                "communicating exports take autodiff forces from energy_fn or "
-                "per-edge forces; a direct atom force_fn has no ghost-row "
-                "convention"
+                "communicating exports take autodiff forces from energy_fn, per-edge "
+                "forces, per-atom forces on half edges, or per-atom forces on full pairing "
+                "with newton='off'; with newton on a direct atom force_fn on full pairing "
+                "has no ghost-row convention"
             )
         if force_output == EDGE_FORCE and not half_edges:
             raise ValueError(
@@ -269,10 +306,11 @@ def export_model(
         )
     if pair_sum and (comm or n_hops > 1 or half_edges or force_output == EDGE_FORCE):
         raise ValueError("pair_sum needs a plain full-pairing energy export")
-    if max_owned is not None and not (comm and 0 < max_owned <= max_atoms):
+    if max_owned is not None and not ((comm or (matrix and n_hops == 1))
+                                      and 0 < max_owned <= max_atoms):
         raise ValueError(
-            "max_owned needs a communicating export and 0 < max_owned <= "
-            "max_atoms; ghost rows only refresh through the exchange"
+            "max_owned needs a communicating or single-hop neighbor-matrix export and "
+            "0 < max_owned <= max_atoms; other layouts hold ghost rows past the owned ones"
         )
     # Communicating half-edge exports pack each boundary pair on one rank.
     unique_boundary = comm and half_edges
@@ -299,32 +337,40 @@ def export_model(
         newton = "on"
 
     max_atoms = int(max_atoms)
-    max_edges = int(max_edges)
     cutoff = float(cutoff)
     n_hops = int(n_hops)
     dtype = jnp.float64 if precision == "float64" else jnp.float32
     scalar_i32 = jax.ShapeDtypeStruct((), jnp.int32)
-    edge_i32 = jax.ShapeDtypeStruct((max_edges,), jnp.int32)
+    if matrix:
+        rows = int(max_owned) if max_owned is not None else max_atoms
+        graph_args: tuple[Any, ...] = (
+            jax.ShapeDtypeStruct((int(max_neighbors), rows), jnp.int32),  # neighbors
+            jax.ShapeDtypeStruct((rows,), jnp.int32),  # num_neighbors
+        )
+    else:
+        max_edges = int(max_edges)
+        edge_i32 = jax.ShapeDtypeStruct((max_edges,), jnp.int32)
+        graph_args = (edge_i32, edge_i32, jax.ShapeDtypeStruct((max_edges,), jnp.bool_))
     args: tuple[Any, ...] = (
         jax.ShapeDtypeStruct((max_atoms, 3), dtype),  # positions
         jax.ShapeDtypeStruct((max_atoms,), jnp.int32),  # species
         scalar_i32,  # nlocal
         scalar_i32,  # nghost
-        edge_i32,  # senders
-        edge_i32,  # receivers
-        jax.ShapeDtypeStruct((max_edges,), jnp.bool_),  # edge_mask
+        *graph_args,
     )
     if uses_box:
         args += (jax.ShapeDtypeStruct((3, 3), dtype),)
+    n_fixed = 4 + len(graph_args)
 
     def call_model_with(
         model_fn: Callable[..., Any],
         model_args: tuple[Any, ...],
         comm_obj: Comm | None = None,
-    ) -> tuple[Any, LammpsNeighborList, Any, Any]:
-        positions, species, nlocal, nghost, senders, receivers, edge_mask = model_args[:7]
-        graph = LammpsNeighborList(senders=senders, receivers=receivers, edge_mask=edge_mask)
-        extra = (model_args[7],) if uses_box else ()
+    ) -> tuple[Any, Graph, Any, Any]:
+        positions, species, nlocal, nghost = model_args[:4]
+        graph: Graph = (LammpsNeighborMatrix(*model_args[4:n_fixed]) if matrix
+                        else LammpsNeighborList(*model_args[4:n_fixed]))
+        extra = (model_args[n_fixed],) if uses_box else ()
         if comm_obj is not None:
             value = model_fn(positions, species, graph, *extra, comm_obj)
             comm_obj.validate()
@@ -372,7 +418,7 @@ def export_model(
 
     def call_model(
         model_fn: Callable[..., Any], model_args: tuple[Any, ...]
-    ) -> tuple[Any, LammpsNeighborList, Any, Any]:
+    ) -> tuple[Any, Graph, Any, Any]:
         if comm:
             # Fresh per trace: token and width record are trace-local.
             comm_obj = Comm(enabled=True, expected_widths=comm_widths, dtype=dtype)
@@ -476,9 +522,9 @@ def export_model(
         "compile_options_b64": base64.b64encode(
             strip_debug_options(compile_options.SerializeAsString())).decode("ascii"),
         "contract": {
-            "input_layout": INPUT_LAYOUT,
+            "input_layout": NEIGHBOR_MATRIX_LAYOUT if matrix else SPARSE_EDGE_LAYOUT,
             "max_atoms": max_atoms,
-            "max_edges": max_edges,
+            **({"max_neighbors": int(max_neighbors)} if matrix else {"max_edges": max_edges}),
             "cutoff": cutoff,
             "unit_style": unit_style,
             "precision": precision,

@@ -63,6 +63,9 @@ class PairJaxKokkos : public Pair, public KokkosBase {
   bool comm_enabled() const;
   bool f64_enabled() const;
   bool half_list() const;
+  bool matrix_layout() const;
+  // Matrix rows: max_owned when the contract bounds owned atoms, else max_atoms.
+  int matrix_rows() const;
   // Calls f with a float or double value per the contract precision; f deduces Scalar from it.
   template <typename F>
   auto dispatch_by_precision(F &&f)
@@ -87,7 +90,7 @@ class PairJaxKokkos : public Pair, public KokkosBase {
   // Optional fourth pair_coeff argument; multiplies model energy and forces.
   double scale = 1.0;
   bool model_loaded = false;
-  // The packed edge graph persists between reneighbor steps; cached count is the launch extent.
+  // Edges packed last step and the edge-force launch extent; unused with the matrix layout.
   int cached_edge_count = 0;
   // Active model-comm site state, valid only inside service_model_comm.
   void *comm_rows = nullptr;
@@ -113,6 +116,7 @@ class PairJaxKokkos : public Pair, public KokkosBase {
     host_box_view<Scalar> host_box;
   };
   using int_view = Kokkos::View<int *, device_type>;
+  using neighbor_view = Kokkos::View<int **, Kokkos::LayoutRight, device_type>;
   using bool_view = Kokkos::View<bool *, device_type>;
   using scalar_int_view = Kokkos::View<int, device_type>;
   using scalar_int_pinned_view = Kokkos::View<int, Kokkos::CudaHostPinnedSpace>;
@@ -156,6 +160,9 @@ class PairJaxKokkos : public Pair, public KokkosBase {
   int_view d_senders;
   int_view d_receivers;
   bool_view d_edge_mask;
+  // Slot-major copy of the LAMMPS list and its row counts, refreshed on rebuild steps.
+  neighbor_view d_neighbors;
+  int_view d_num_neighbors;
   CUevent input_ready_event = nullptr;
 #endif
 };

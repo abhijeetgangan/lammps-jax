@@ -8,6 +8,12 @@
 
 namespace lammps_jax {
 
+// Sparse edge arrays, or a slot-major [max_neighbors, rows] copy of the LAMMPS list.
+enum class InputLayout {
+  SparseEdge,
+  NeighborMatrix,
+};
+
 // Atom rows add per-atom forces; Edge rows hold dU/d(rij), sender plus, receiver minus.
 enum class ForceLayout {
   Atom,
@@ -35,9 +41,12 @@ struct ProgramSet {
 };
 
 struct ModelContract {
+  InputLayout input_layout = InputLayout::SparseEdge;
   // Fixed input capacities, checked collectively at reneighbor steps, never resized.
   int max_atoms = 0;
+  // Edge slots of the sparse layout, or list slots per row of the matrix; the other stays 0.
   int max_edges = 0;
+  int max_neighbors = 0;
   // Model cutoff; init_one reports it to LAMMPS as the pair cutoff.
   double cutoff = 0.0;
   // Must match the run's unit style when pair_coeff loads the bundle.

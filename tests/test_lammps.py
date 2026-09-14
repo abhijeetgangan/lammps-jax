@@ -115,6 +115,20 @@ EXPORTS = {
                        "examples/potentials/CuZr.eam.alloy.gz",
                        "--max-atoms", "3072", "--edges-per-atom", "32",
                        "--half-edges", "--mode", "comm", "--precision", "float64")),
+    "cuzr_pallas": ("export_eam_pallas.py",
+                    ("examples/potentials/CuZr.eam.alloy.gz", "{output}",
+                     "--max-atoms", "3072", "--edges-per-atom", "32")),
+    "cuzr_pallas_rows": ("export_eam_pallas.py",
+                         ("examples/potentials/CuZr.eam.alloy.gz", "{output}",
+                          "--max-atoms", "3072", "--neighbor-matrix", "160",
+                          "--max-owned", "512")),
+    "cuzr_pallas_rows_full": ("export_eam_pallas.py",
+                              ("examples/potentials/CuZr.eam.alloy.gz", "{output}",
+                               "--max-atoms", "3072", "--neighbor-matrix", "192",
+                               "--max-owned", "512", "--newton", "off")),
+    "cuzr_pallas_rows_small": ("export_eam_pallas.py",
+                               ("examples/potentials/CuZr.eam.alloy.gz", "{output}",
+                                "--max-atoms", "3072", "--neighbor-matrix", "8")),
 }
 
 DECKS = {
@@ -223,6 +237,45 @@ run_style verlet/kk
 run 0
 run 50
 """,
+    "cuzr_nve": """\
+variable bundle index cuzr.lammps-jax.json
+variable dump_path index cuzr_nve.dump
+
+units metal
+atom_style atomic
+boundary p p p
+newton on
+
+lattice bcc 3.26
+region box block 0 6 0 6 0 6
+create_box 2 box
+create_atoms 1 box basis 1 1 basis 2 2
+mass 1 63.546
+mass 2 91.224
+
+displace_atoms all random 0.1 0.1 0.1 12345 units box
+
+neighbor 1.0 bin
+neigh_modify every 2 delay 0 check no one 512 page 500000
+
+pair_style jax/kk ${pjrt}
+pair_coeff * * ${bundle}
+
+velocity all create 300.0 4928459 loop geom
+fix integrate all nve
+timestep 0.002
+
+thermo 5
+thermo_style custom step atoms pe ke etotal press
+thermo_modify norm no format float %.16g
+
+dump trajectory all custom 5 ${dump_path} id type xu yu zu fx fy fz
+dump_modify trajectory sort id format float %.16g first yes
+
+run_style verlet/kk
+run 0
+run 50
+""",
     "mace_nve": """\
 variable bundle index mace.lammps-jax.json
 variable dump_path index mace_nve.dump
@@ -264,11 +317,12 @@ run 50
     "cuzr_static": """\
 variable bundle index cuzr.lammps-jax.json
 variable dump_path index cuzr_static.dump
+variable newton_setting index on
 
 units metal
 atom_style atomic
 boundary p p p
-newton on
+newton ${newton_setting}
 
 lattice bcc 3.26
 region box block 0 6 0 6 0 6
@@ -357,7 +411,22 @@ CASES = {
         kind="static", deck="cuzr_static", bundle="cuzr_uniq_f64", newton="on",
         pressure=True, float64=True, dense="cuzr",
         energy_tol=1.0e-12, pressure_tol=1.0e-8),
+    # Pallas force kernels over the same half edges as cuzr_uniq.
+    "cuzr_pallas_static": dict(
+        kind="static", deck="cuzr_static", bundle="cuzr_pallas", newton="on",
+        pressure=True, dense="cuzr", pressure_tol=1.0e-2),
+    # Pallas row kernels over the LAMMPS half list itself, energies included.
+    "cuzr_pallas_rows_static": dict(
+        kind="static", deck="cuzr_static", bundle="cuzr_pallas_rows", newton="on",
+        pressure=True, dense="cuzr", pressure_tol=1.0e-2),
+    # Full list with newton off: rows are complete, only the forward exchange runs, no pair virial.
+    "cuzr_pallas_rows_full_static": dict(
+        kind="static", deck="cuzr_static", bundle="cuzr_pallas_rows_full", newton="off",
+        dense="cuzr"),
     "eam_nve": dict(kind="nve", deck="eam_nve", bundle="eam", dense="eam"),
+    # Lists rebuilt every other step: the matrix copy is skipped, then refreshed after migration.
+    "cuzr_pallas_rows_nve": dict(kind="nve", deck="cuzr_nve", bundle="cuzr_pallas_rows",
+                                 dense="cuzr", pressure_tol=1.0e-2),
     "mace_comm_nve": dict(kind="nve", deck="mace_nve", bundle="mace_comm",
                           pressure_tol=5.0e-2),
     "mace_oeq_nve": dict(kind="nve", deck="mace_nve", bundle="mace_oeq",
@@ -378,6 +447,8 @@ NEGATIVE_CONTROLS = {
     "mace_owned_exceeded": dict(bundle="mace_owned_small", newton="on",
                                 variables={}, deck="mace_nve",
                                 message="owned-row capacity exceeded"),
+    "cuzr_rows_capacity": dict(bundle="cuzr_pallas_rows_small", newton="on", variables={},
+                               deck="cuzr_static", message="neighbor capacity exceeded"),
 }
 
 FORCE_COLUMNS = ("fx", "fy", "fz")
@@ -850,7 +921,8 @@ class LammpsRunner:
                     newton=spec.get("newton", "on"),
                     nprocs=nprocs,
                     variables={"bundle": bundle_path,
-                               "dump_path": dump_path},
+                               "dump_path": dump_path,
+                               "newton_setting": spec.get("newton", "on")},
                     extra_env=self.sidecar_env(bundle_path),
                 )
                 grid = re.search(r"(\d+) by (\d+) by (\d+) MPI processor grid",
@@ -947,8 +1019,12 @@ def test_nve_trajectory(runner, case):
     "case_a, case_b",
     [("eam_comm_static", "eam_ghostx_static"),
      ("eam_comm_half_static", "eam_comm_static"),
-     ("eam_comm_f64_static", "eam_comm_static")],
-    ids=["eam", "eam-comm-pairing", "eam-comm-precision"],
+     ("eam_comm_f64_static", "eam_comm_static"),
+     ("cuzr_pallas_static", "cuzr_uniq_static"),
+     ("cuzr_pallas_rows_static", "cuzr_uniq_static"),
+     ("cuzr_pallas_rows_full_static", "cuzr_uniq_static")],
+    ids=["eam", "eam-comm-pairing", "eam-comm-precision", "cuzr-pallas", "cuzr-pallas-rows",
+         "cuzr-pallas-rows-full"],
 )
 def test_scheme_cross_agreement(runner, case_a, case_b):
     """Same weights and coordinates under two schemes or edge packings.

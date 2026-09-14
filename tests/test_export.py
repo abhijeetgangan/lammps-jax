@@ -13,7 +13,8 @@ from lammps_jax.export import (
     ATOM_FORCE,
     BUNDLE_FORMAT,
     EDGE_FORCE,
-    INPUT_LAYOUT,
+    SPARSE_EDGE_LAYOUT,
+    export_model,
     program_text,
     wrap_energy_fn,
 )
@@ -52,7 +53,7 @@ def test_export_model_writes_expected_abi(tmp_path):
     assert data["format"] == BUNDLE_FORMAT
     assert data["contract"]["max_atoms"] == 4
     assert data["contract"]["max_edges"] == 6
-    assert data["contract"]["input_layout"] == INPUT_LAYOUT
+    assert data["contract"]["input_layout"] == SPARSE_EDGE_LAYOUT
     assert data["contract"]["force_output"] == ATOM_FORCE
     assert data["contract"]["newton"] == "on"
     assert "n_species" not in data["contract"]
@@ -78,6 +79,8 @@ def test_export_model_writes_expected_abi(tmp_path):
             "newton-dependent",
         ),
         ({"energy_fn": pair_energy, "precision": "bfloat16"}, "precision"),
+        ({"force_fn": pair_force, "comm": True}, "full pairing"),
+        ({"force_fn": pair_force, "comm": True, "half_edges": True}, "newton='on'"),
     ],
 )
 def test_export_model_rejects_invalid_configs(tmp_path, kwargs, message):
@@ -90,6 +93,28 @@ def test_export_model_rejects_invalid_configs(tmp_path, kwargs, message):
             unit_style="lj",
             **kwargs,
         )
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"max_edges": 6, "max_neighbors": 4}, "exactly one"),
+        ({}, "exactly one"),
+        ({"max_neighbors": 4, "force_output": EDGE_FORCE, "newton": "on"}, "sparse edge layout"),
+        ({"max_neighbors": 4, "half_edges": True, "newton": "on"}, "hands the model"),
+    ],
+)
+def test_export_model_rejects_invalid_layouts(tmp_path, kwargs, message):
+    with pytest.raises(ValueError, match=message):
+        export_model(force_fn=pair_force, path=tmp_path / "bad.json", max_atoms=4, cutoff=2.0,
+                     unit_style="lj", **kwargs)
+
+
+def test_export_model_rejects_full_pairing_atom_forces_with_newton_on(tmp_path):
+    """Communicating full-pairing atom forces land on owned rows only, which needs newton off."""
+    with pytest.raises(ValueError, match="newton='off'"):
+        export_model(force_fn=pair_force, path=tmp_path / "bad.json", max_atoms=4, max_edges=6,
+                     cutoff=2.0, unit_style="lj", comm=True, newton="on")
 
 
 def test_export_model_records_n_species(tmp_path):
@@ -256,7 +281,7 @@ def test_export_model_accepts_edge_force_output(tmp_path):
         cutoff=2.0,
         unit_style="lj",
     )
-    assert data["contract"]["input_layout"] == INPUT_LAYOUT
+    assert data["contract"]["input_layout"] == SPARSE_EDGE_LAYOUT
     assert data["contract"]["force_output"] == EDGE_FORCE
     assert data["contract"]["newton"] == "on"
     assert re.search(r"->\s*\(?tensor<6x3xf32>", program_text(data, "force_mlir"))
