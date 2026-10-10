@@ -15,12 +15,10 @@
 
 #include "kokkos_type.h"
 
-#if defined(KOKKOS_ENABLE_CUDA) && !defined(LMP_KOKKOS_DOUBLE_DOUBLE) && \
-    !defined(LMP_KOKKOS_SINGLE_SINGLE) && !defined(LMP_KOKKOS_SINGLE_DOUBLE)
+#if !defined(LMP_KOKKOS_DOUBLE_DOUBLE) && !defined(LMP_KOKKOS_SINGLE_SINGLE) && \
+    !defined(LMP_KOKKOS_SINGLE_DOUBLE)
 #error "pair jax/kk needs the KOKKOS precision layer: LAMMPS 10 Sep 2025 or newer"
 #endif
-
-#include <cuda.h>
 
 #include <memory>
 #include <string>
@@ -47,14 +45,12 @@ class PairJaxKokkos : public Pair, public KokkosBase {
   int pack_reverse_comm(int, int, double *) override;
   void unpack_reverse_comm(int, int *, double *) override;
 
-#ifdef KOKKOS_ENABLE_CUDA
   // Device variants exchange rows in place through Kokkos comm buffers.
   int pack_forward_comm_kokkos(int, DAT::tdual_int_1d, DAT::tdual_double_1d &, int,
                                int *) override;
   void unpack_forward_comm_kokkos(int, int, DAT::tdual_double_1d &) override;
   int pack_reverse_comm_kokkos(int, int, DAT::tdual_double_1d &) override;
   void unpack_reverse_comm_kokkos(int, DAT::tdual_int_1d, DAT::tdual_double_1d &) override;
-#endif
 
  protected:
   void allocate();
@@ -97,7 +93,6 @@ class PairJaxKokkos : public Pair, public KokkosBase {
   void *d_comm_rows = nullptr;
   int comm_width = 0;
 
-#ifdef KOKKOS_ENABLE_CUDA
   using device_type = LMPDeviceType;
   using x_view = typename ArrayTypes<device_type>::t_kkfloat_1d_3_lr_randomread;
   using type_view = typename ArrayTypes<device_type>::t_int_1d_randomread;
@@ -119,7 +114,12 @@ class PairJaxKokkos : public Pair, public KokkosBase {
   using neighbor_view = Kokkos::View<int **, Kokkos::LayoutRight, device_type>;
   using bool_view = Kokkos::View<bool *, device_type>;
   using scalar_int_view = Kokkos::View<int, device_type>;
-  using scalar_int_pinned_view = Kokkos::View<int, Kokkos::CudaHostPinnedSpace>;
+#ifdef KOKKOS_ENABLE_CUDA
+  using pinned_space = Kokkos::CudaHostPinnedSpace;
+#else
+  using pinned_space = Kokkos::HostSpace;
+#endif
+  using scalar_int_pinned_view = Kokkos::View<int, pinned_space>;
 
   void pack_atoms(int nall, const x_view &x, const type_view &type);
   template <typename Scalar>
@@ -129,14 +129,20 @@ class PairJaxKokkos : public Pair, public KokkosBase {
   void pack_box();
   template <typename Scalar>
   void pack_box_as();
-  pjrt::ExecutionRequest make_request(CUstream stream, CUevent ready_event);
+  pjrt::ExecutionRequest make_request(pjrt::device::Stream stream,
+                                      pjrt::device::Event ready_event);
   template <typename Scalar>
-  pjrt::ExecutionRequest make_request_as(CUstream stream, CUevent ready_event);
+  pjrt::ExecutionRequest make_request_as(pjrt::device::Stream stream,
+                                         pjrt::device::Event ready_event);
   template <typename Scalar>
   void allocate_staging_as(int max_atoms);
-  void add_model_forces(CUdeviceptr force_output, const f_view &f, int nlocal, int nall);
+  void add_model_forces(pjrt::device::Pointer force_output, const f_view &f, int nlocal,
+                        int nall);
   template <typename Scalar>
-  void add_model_forces_as(CUdeviceptr force_output, const f_view &f, int nlocal, int nall);
+  void add_model_forces_as(pjrt::device::Pointer force_output, const f_view &f, int nlocal,
+                           int nall);
+  // The execution space's stream; null on host backends.
+  pjrt::device::Stream stream() const;
 
   device_type exec;
   Staging<float> staging32;
@@ -163,8 +169,7 @@ class PairJaxKokkos : public Pair, public KokkosBase {
   // Slot-major copy of the LAMMPS list and its row counts, refreshed on rebuild steps.
   neighbor_view d_neighbors;
   int_view d_num_neighbors;
-  CUevent input_ready_event = nullptr;
-#endif
+  pjrt::device::Event input_ready_event = nullptr;
 };
 
 } // namespace LAMMPS_NS

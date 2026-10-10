@@ -17,6 +17,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# The XLA CPU PJRT plugin for host Kokkos builds (pjrt-cpu/); jax ships none.
+cpu = [
+  "lammps-jax-pjrt-cpu>=0.10.1; sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
 dist = [
   "ase>=3.22",
   "e3nn-jax>=0.20",

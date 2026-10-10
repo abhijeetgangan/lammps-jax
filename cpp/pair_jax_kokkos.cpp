@@ -20,8 +20,6 @@
 #include "update.h"
 #include "utils.h"
 
-#include <cuda.h>
-
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
@@ -33,7 +31,6 @@ using namespace LAMMPS_NS;
 
 namespace {
 
-#ifdef KOKKOS_ENABLE_CUDA
 // Functors template on the contract precision Scalar: f32 pack narrows, f64 pack copies.
 template <class DeviceType, typename Scalar>
 struct PackAtomsFunctor {
@@ -320,13 +317,10 @@ struct AddCommRowsByList {
   }
 };
 
-#endif
-
 } // namespace
 
 PairJaxKokkos::PairJaxKokkos(LAMMPS *lmp) : Pair(lmp)
 {
-#ifdef KOKKOS_ENABLE_CUDA
   kokkosable = 1;
   atomKK = (AtomKokkos *) atom;
   execution_space = ExecutionSpaceFromDevice<LMPDeviceType>::space;
@@ -337,16 +331,11 @@ PairJaxKokkos::PairJaxKokkos(LAMMPS *lmp) : Pair(lmp)
   one_coeff = 1;
   restartinfo = 0;
   single_enable = 0;
-#else
-  error->all(FLERR, "pair_style jax/kk requires LAMMPS KOKKOS built with CUDA");
-#endif
 }
 
 PairJaxKokkos::~PairJaxKokkos()
 {
-#ifdef KOKKOS_ENABLE_CUDA
-  if (input_ready_event != nullptr) cuEventDestroy(input_ready_event);
-#endif
+  pjrt::device::destroy_event(input_ready_event);
   if (allocated) {
     memory->destroy(setflag);
     memory->destroy(cutsq);
@@ -365,7 +354,6 @@ void PairJaxKokkos::allocate()
 
 void PairJaxKokkos::allocate_device_buffers()
 {
-#ifdef KOKKOS_ENABLE_CUDA
   const int max_atoms = bundle.contract.max_atoms;
   const int max_edges = bundle.contract.max_edges;
   // Kokkos zero-init is the padding contract; only the contract-precision views are allocated.
@@ -395,13 +383,9 @@ void PairJaxKokkos::allocate_device_buffers()
     Kokkos::deep_copy(d_receivers, max_atoms);
   }
   // Rank-local failure: the throw reaches coeff()'s catch, which error->one's.
-  if (input_ready_event == nullptr &&
-      cuEventCreate(&input_ready_event, CU_EVENT_DISABLE_TIMING) != CUDA_SUCCESS)
-    throw std::runtime_error("Failed to create CUDA event for LAMMPS-JAX inputs");
-#endif
+  if (input_ready_event == nullptr) input_ready_event = pjrt::device::create_event();
 }
 
-#ifdef KOKKOS_ENABLE_CUDA
 template <typename Scalar>
 void PairJaxKokkos::allocate_staging_as(int max_atoms)
 {
@@ -412,7 +396,15 @@ void PairJaxKokkos::allocate_staging_as(int max_atoms)
     views.host_box = host_box_view<Scalar>("lammps_jax_host_box");
   }
 }
+
+pjrt::device::Stream PairJaxKokkos::stream() const
+{
+#ifdef KOKKOS_ENABLE_CUDA
+  return exec.cuda_stream();
+#else
+  return nullptr;
 #endif
+}
 
 bool PairJaxKokkos::edge_force_enabled() const
 {
@@ -528,7 +520,6 @@ void PairJaxKokkos::unpack_reverse_comm(int n, int *list, double *buf)
   });
 }
 
-#ifdef KOKKOS_ENABLE_CUDA
 int PairJaxKokkos::pack_forward_comm_kokkos(int n, DAT::tdual_int_1d k_sendlist,
                                             DAT::tdual_double_1d &k_buf, int /*pbc_flag*/,
                                             int * /*pbc*/)
@@ -578,7 +569,6 @@ void PairJaxKokkos::unpack_reverse_comm_kokkos(int n, DAT::tdual_int_1d k_sendli
                                   static_cast<Scalar *>(d_comm_rows), comm_width, slots});
   });
 }
-#endif
 
 void PairJaxKokkos::settings(int narg, char **arg)
 {
@@ -694,12 +684,14 @@ void PairJaxKokkos::init_style()
   if (comm_enabled() && runtime && runtime->model_comm()) {
     // Kokkos brick and tiled comm exchange rows in place on device; anything else
     // stages through pinned host.
-    device_comm = (dynamic_cast<CommKokkos *>(comm) != nullptr ||
+    // Host Kokkos stages too: LAMMPS packs its pair comm with the host routines.
+    device_comm = execution_space == Device &&
+                  (dynamic_cast<CommKokkos *>(comm) != nullptr ||
                    dynamic_cast<CommTiledKokkos *>(comm) != nullptr) &&
                   !lmp->kokkos->forward_pair_comm_legacy &&
                   !lmp->kokkos->reverse_pair_comm_legacy;
     runtime->model_comm()->set_device_rows(device_comm,
-                                           device_comm ? exec.cuda_stream() : nullptr);
+                                           device_comm ? stream() : nullptr);
   }
   const bool multi_hop = bundle.contract.n_hops > 1;
   if (comm->me == 0) {
@@ -788,7 +780,6 @@ double PairJaxKokkos::init_one(int i, int j)
   return bundle.contract.cutoff;
 }
 
-#ifdef KOKKOS_ENABLE_CUDA
 void PairJaxKokkos::pack_atoms(int nall, const PairJaxKokkos::x_view &x,
                                const PairJaxKokkos::type_view &type)
 {
@@ -905,55 +896,58 @@ void PairJaxKokkos::pack_box_as()
   Kokkos::deep_copy(exec, views.box, views.host_box);
 }
 
-pjrt::ExecutionRequest PairJaxKokkos::make_request(CUstream stream, CUevent ready_event)
+pjrt::ExecutionRequest PairJaxKokkos::make_request(pjrt::device::Stream stream,
+                                                   pjrt::device::Event ready_event)
 {
   return dispatch_by_precision(
       [&](auto p) { return make_request_as<decltype(p)>(stream, ready_event); });
 }
 
 template <typename Scalar>
-pjrt::ExecutionRequest PairJaxKokkos::make_request_as(CUstream stream, CUevent ready_event)
+pjrt::ExecutionRequest PairJaxKokkos::make_request_as(pjrt::device::Stream stream,
+                                                      pjrt::device::Event ready_event)
 {
+  using pjrt::device::Pointer;
   auto &views = staging<Scalar>();
   const pjrt::ElementType real_type =
       std::is_same_v<Scalar, double> ? pjrt::ElementType::F64 : pjrt::ElementType::F32;
-  const CUdeviceptr positions_pointer = reinterpret_cast<CUdeviceptr>(views.positions.data());
+  const Pointer positions_pointer = reinterpret_cast<Pointer>(views.positions.data());
   pjrt::ExecutionRequest request;
   request.stream = stream;
   request.input_ready_event = ready_event;
   request.scalar_type = real_type;
   request.inputs = {
       {"positions", positions_pointer, {bundle.contract.max_atoms, 3}, real_type},
-      {"species", reinterpret_cast<CUdeviceptr>(d_species.data()), {bundle.contract.max_atoms},
+      {"species", reinterpret_cast<Pointer>(d_species.data()), {bundle.contract.max_atoms},
        pjrt::ElementType::S32},
-      {"nlocal", reinterpret_cast<CUdeviceptr>(d_nlocal.data()), {}, pjrt::ElementType::S32},
-      {"nghost", reinterpret_cast<CUdeviceptr>(d_nghost.data()), {}, pjrt::ElementType::S32},
+      {"nlocal", reinterpret_cast<Pointer>(d_nlocal.data()), {}, pjrt::ElementType::S32},
+      {"nghost", reinterpret_cast<Pointer>(d_nghost.data()), {}, pjrt::ElementType::S32},
   };
   if (matrix_layout()) {
-    request.inputs.push_back({"neighbors", reinterpret_cast<CUdeviceptr>(d_neighbors.data()),
+    request.inputs.push_back({"neighbors", reinterpret_cast<Pointer>(d_neighbors.data()),
                               {bundle.contract.max_neighbors, matrix_rows()},
                               pjrt::ElementType::S32});
     request.inputs.push_back({"num_neighbors",
-                              reinterpret_cast<CUdeviceptr>(d_num_neighbors.data()),
+                              reinterpret_cast<Pointer>(d_num_neighbors.data()),
                               {matrix_rows()}, pjrt::ElementType::S32});
   } else {
-    request.inputs.push_back({"senders", reinterpret_cast<CUdeviceptr>(d_senders.data()),
+    request.inputs.push_back({"senders", reinterpret_cast<Pointer>(d_senders.data()),
                               {bundle.contract.max_edges}, pjrt::ElementType::S32});
-    request.inputs.push_back({"receivers", reinterpret_cast<CUdeviceptr>(d_receivers.data()),
+    request.inputs.push_back({"receivers", reinterpret_cast<Pointer>(d_receivers.data()),
                               {bundle.contract.max_edges}, pjrt::ElementType::S32});
-    request.inputs.push_back({"edge_mask", reinterpret_cast<CUdeviceptr>(d_edge_mask.data()),
+    request.inputs.push_back({"edge_mask", reinterpret_cast<Pointer>(d_edge_mask.data()),
                               {bundle.contract.max_edges}, pjrt::ElementType::Pred});
   }
   if (bundle.contract.uses_box) {
-    const CUdeviceptr box_pointer = reinterpret_cast<CUdeviceptr>(views.box.data());
+    const Pointer box_pointer = reinterpret_cast<Pointer>(views.box.data());
     request.inputs.emplace_back("box", box_pointer, std::vector<int64_t>{3, 3}, real_type);
   }
   return request;
 }
 
 template <typename Scalar>
-void PairJaxKokkos::add_model_forces_as(CUdeviceptr force_output, const PairJaxKokkos::f_view &f,
-                                        int nlocal, int nall)
+void PairJaxKokkos::add_model_forces_as(pjrt::device::Pointer force_output,
+                                        const PairJaxKokkos::f_view &f, int nlocal, int nall)
 {
   using ForceView = Kokkos::View<const Scalar *[3], Kokkos::LayoutRight, LMPDeviceType,
                                 Kokkos::MemoryTraits<Kokkos::Unmanaged>>;
@@ -973,20 +967,16 @@ void PairJaxKokkos::add_model_forces_as(CUdeviceptr force_output, const PairJaxK
   }
 }
 
-void PairJaxKokkos::add_model_forces(CUdeviceptr force_output, const PairJaxKokkos::f_view &f,
-                                     int nlocal, int nall)
+void PairJaxKokkos::add_model_forces(pjrt::device::Pointer force_output,
+                                     const PairJaxKokkos::f_view &f, int nlocal, int nall)
 {
   // Model force rows are f32 or f64 per the contract precision.
   dispatch_by_precision(
       [&](auto p) { add_model_forces_as<decltype(p)>(force_output, f, nlocal, nall); });
 }
-#endif
 
 void PairJaxKokkos::compute(int eflag, int vflag)
 {
-#ifndef KOKKOS_ENABLE_CUDA
-  error->all(FLERR, "pair_style jax/kk requires CUDA");
-#else
   ev_init(eflag, vflag, 0);
   if (!model_loaded || runtime == nullptr) error->all(FLERR, "LAMMPS-JAX runtime is not initialized");
   // Global energy/virial flags fire every thermo step, so unavailable values
@@ -1017,7 +1007,7 @@ void PairJaxKokkos::compute(int eflag, int vflag)
   typename AT::t_kkfloat_1d_3_lr_randomread x = atomKK->k_x.view<LMPDeviceType>();
   typename AT::t_int_1d_randomread type = atomKK->k_type.view<LMPDeviceType>();
   typename AT::t_kkacc_1d_3 f = atomKK->k_f.view<LMPDeviceType>();
-  CUstream stream = reinterpret_cast<CUstream>(exec.cuda_stream());
+  const pjrt::device::Stream stream = this->stream();
 
   pack_atoms(nall, x, type);
   pack_edges(klist, rebuild_edges, x);
@@ -1046,8 +1036,7 @@ void PairJaxKokkos::compute(int eflag, int vflag)
 
   pjrt::ExecutionResult result;
   try {
-    if (cuEventRecord(input_ready_event, stream) != CUDA_SUCCESS)
-      throw std::runtime_error("Failed to record CUDA event for LAMMPS-JAX inputs");
+    pjrt::device::record_event(input_ready_event, stream);
     pjrt::ExecutionRequest request = make_request(stream, input_ready_event);
     // Execution runs on a worker while this thread services exchanges through LAMMPS comm.
     request.nlocal = nlocal;
@@ -1083,7 +1072,7 @@ void PairJaxKokkos::compute(int eflag, int vflag)
   if (include_energy) eng_vdwl += scale * result.energy;
   if (!energy_only_step) {
     try {
-      runtime->consume_force_output(stream, [&](CUdeviceptr force_output) {
+      runtime->consume_force_output(stream, [&](pjrt::device::Pointer force_output) {
         add_model_forces(force_output, f, nlocal, nall);
       });
     } catch (const std::exception &e) {
@@ -1099,5 +1088,4 @@ void PairJaxKokkos::compute(int eflag, int vflag)
       vflag_fdotr = 0;
     }
   }
-#endif
 }

@@ -1,9 +1,8 @@
 #ifndef PJRT_OUTPUT_LIFETIME_H
 #define PJRT_OUTPUT_LIFETIME_H
 
+#include "pjrt/device.h"
 #include "pjrt/handles.h"
-
-#include <cuda.h>
 
 #include <functional>
 #include <vector>
@@ -23,14 +22,14 @@ class OutputLifetime {
   void cleanup_before_execution();
 
   // Stashes the force output of the latest execution for one consumer call.
-  void retain_force_output(BufferPtr buffer, CUdeviceptr pointer);
+  void retain_force_output(BufferPtr buffer, device::Pointer pointer);
   PJRT_Buffer *pending_force_buffer() const { return pending_force_output_.get(); }
 
   // Invokes the consumer with the force pointer. Afterwards the buffer is
   // retired behind an event recorded on consumer_stream, even if the consumer
   // throws.
-  void consume_force_output(CUstream consumer_stream,
-                            const std::function<void(CUdeviceptr)> &consumer);
+  void consume_force_output(device::Stream consumer_stream,
+                            const std::function<void(device::Pointer)> &consumer);
 
   // Synchronously releases everything. Call before tearing down the client.
   void reset();
@@ -38,14 +37,14 @@ class OutputLifetime {
  private:
   struct RetiredOutput {
     BufferPtr buffer;
-    CUevent ready_event = nullptr;
+    device::Event ready_event = nullptr;
   };
 
-  void retire_pending(CUstream consumer_stream);
+  void retire_pending(device::Stream consumer_stream);
   void collect_retired(bool wait);
 
   BufferPtr pending_force_output_{nullptr, BufferDeleter{}};
-  CUdeviceptr pending_force_pointer_ = 0;
+  device::Pointer pending_force_pointer_ = 0;
   std::vector<RetiredOutput> retired_outputs_;
 };
 

@@ -2,12 +2,11 @@
 #define PJRT_RUNTIME_H
 
 #include "pjrt/client_session.h"
+#include "pjrt/device.h"
 #include "pjrt/model_comm.h"
 #include "pjrt/handles.h"
 #include "pjrt/output_lifetime.h"
 #include "pjrt/plugin.h"
-
-#include <cuda.h>
 
 #include <condition_variable>
 #include <cstdint>
@@ -30,15 +29,15 @@ enum class ElementType {
 
 struct DeviceBufferSpec {
   std::string name;
-  CUdeviceptr pointer = 0;
+  device::Pointer pointer = 0;
   std::vector<int64_t> dims;
   ElementType element_type = ElementType::F32;
 };
 
 struct ExecutionRequest {
   std::vector<DeviceBufferSpec> inputs;
-  CUstream stream = nullptr;
-  CUevent input_ready_event = nullptr;
+  device::Stream stream = nullptr;
+  device::Event input_ready_event = nullptr;
   // Element type of energy and force outputs; validated before readback.
   ElementType scalar_type = ElementType::F32;
   // Owned/ghost row split for communicating exchange handlers; ignored otherwise.
@@ -83,8 +82,8 @@ class Runtime {
   ExecutionResult execute_energy_force(const ExecutionRequest &request);
 
   // Lends the latest force output pointer; the buffer retires behind a consumer-stream event.
-  void consume_force_output(CUstream consumer_stream,
-                            const std::function<void(CUdeviceptr)> &consumer);
+  void consume_force_output(device::Stream consumer_stream,
+                            const std::function<void(device::Pointer)> &consumer);
 
   // Null for bundles without communication.
   ModelComm *model_comm() const { return model_comm_.get(); }

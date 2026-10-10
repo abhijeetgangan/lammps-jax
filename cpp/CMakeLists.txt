@@ -36,6 +36,17 @@ if(NOT EXISTS "${KOKKOS_CONFIG_INCLUDE_DIR}/KokkosCore_config.h")
     "and pass -DKOKKOS_CONFIG_INCLUDE_DIR=<dir-containing-KokkosCore_config.h>.")
 endif()
 
+# CUDA Kokkos builds run bundles on the GPU PJRT plugin, host Kokkos builds on the CPU plugin.
+file(READ "${KOKKOS_CONFIG_INCLUDE_DIR}/KokkosCore_config.h" KOKKOS_CORE_CONFIG)
+if(KOKKOS_CORE_CONFIG MATCHES "#define KOKKOS_ENABLE_(HIP|SYCL|OPENMPTARGET)")
+  message(FATAL_ERROR
+    "LAMMPS Kokkos targets ${CMAKE_MATCH_1}; lammps-jax supports Kokkos CUDA or a host backend")
+elseif(KOKKOS_CORE_CONFIG MATCHES "#define KOKKOS_ENABLE_CUDA")
+  set(LAMMPS_JAX_BACKEND cuda)
+else()
+  set(LAMMPS_JAX_BACKEND host)
+endif()
+
 find_path(CUDA_INCLUDE_DIR cuda.h
   HINTS "$ENV{CUDA_HOME}/include" "/usr/local/cuda/include")
 find_library(CUDA_DRIVER_LIBRARY cuda
@@ -43,7 +54,7 @@ find_library(CUDA_DRIVER_LIBRARY cuda
         "/usr/lib/x86_64-linux-gnu" "/usr/lib64")
 find_package(MPI REQUIRED COMPONENTS CXX)
 
-if(NOT CUDA_INCLUDE_DIR OR NOT CUDA_DRIVER_LIBRARY)
+if(LAMMPS_JAX_BACKEND STREQUAL "cuda" AND (NOT CUDA_INCLUDE_DIR OR NOT CUDA_DRIVER_LIBRARY))
   message(FATAL_ERROR "CUDA driver headers/library are required for lammps-jax")
 endif()
 
@@ -72,6 +83,7 @@ add_library(lammps_jax MODULE
   lammps_jax_plugin.cpp
   pair_jax_kokkos.cpp
   pjrt/client_session.cpp
+  pjrt/device_${LAMMPS_JAX_BACKEND}.cpp
   pjrt/model_comm.cpp
   pjrt/handles.cpp
   pjrt/plugin.cpp
@@ -90,14 +102,21 @@ target_include_directories(lammps_jax PRIVATE
   "${KOKKOS_ROOT}/tpls/mdspan/include"
   "${KOKKOS_CONFIG_INCLUDE_DIR}"
   "${KOKKOS_CONFIG_INCLUDE_DIR}/core/src"
-  "${CUDA_INCLUDE_DIR}"
   "${JAXLIB_INCLUDE_DIR}"
 )
 if(PJRT_C_API_INCLUDE_DIR)
   target_include_directories(lammps_jax PRIVATE "${PJRT_C_API_INCLUDE_DIR}")
 endif()
 
-target_link_libraries(lammps_jax PRIVATE "${CUDA_DRIVER_LIBRARY}" MPI::MPI_CXX dl)
+target_link_libraries(lammps_jax PRIVATE MPI::MPI_CXX dl)
+if(LAMMPS_JAX_BACKEND STREQUAL "cuda")
+  target_include_directories(lammps_jax PRIVATE "${CUDA_INCLUDE_DIR}")
+  target_link_libraries(lammps_jax PRIVATE "${CUDA_DRIVER_LIBRARY}")
+elseif(KOKKOS_CORE_CONFIG MATCHES "#define KOKKOS_ENABLE_OPENMP")
+  # Kokkos OpenMP headers need the compiler's OpenMP mode, as LAMMPS was built with.
+  find_package(OpenMP REQUIRED COMPONENTS CXX)
+  target_link_libraries(lammps_jax PRIVATE OpenMP::OpenMP_CXX)
+endif()
 
 if(CMAKE_CXX_COMPILER MATCHES "nvcc_wrapper")
   target_compile_options(lammps_jax PRIVATE -fno-lto -extended-lambda -expt-relaxed-constexpr)

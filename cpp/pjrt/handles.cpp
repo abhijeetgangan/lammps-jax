@@ -1,8 +1,5 @@
 #include "pjrt/handles.h"
 
-#include <cuda.h>
-
-#include <sstream>
 #include <stdexcept>
 
 namespace pjrt {
@@ -26,21 +23,6 @@ void check(const PJRT_Api *api, PJRT_Error *error, const std::string &operation)
     api->PJRT_Error_Destroy(&args);
   }
   throw std::runtime_error(operation + " failed: " + message);
-}
-
-void check_cuda(int cu_result, const std::string &operation)
-{
-  const CUresult result = static_cast<CUresult>(cu_result);
-  if (result == CUDA_SUCCESS) return;
-  const char *name = nullptr;
-  const char *message = nullptr;
-  cuGetErrorName(result, &name);
-  cuGetErrorString(result, &message);
-  std::ostringstream out;
-  out << operation << " failed";
-  if (name) out << ": " << name;
-  if (message) out << " (" << message << ")";
-  throw std::runtime_error(out.str());
 }
 
 void BufferDeleter::operator()(PJRT_Buffer *buffer) const

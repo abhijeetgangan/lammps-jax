@@ -1,9 +1,8 @@
 #ifndef PJRT_CLIENT_SESSION_H
 #define PJRT_CLIENT_SESSION_H
 
+#include "pjrt/device.h"
 #include "pjrt/plugin.h"
-
-#include <cuda.h>
 
 namespace pjrt {
 
@@ -28,9 +27,11 @@ class ClientSession {
 
   PJRT_Client *client() const { return client_; }
   PJRT_Device *device() const { return device_; }
-  CUstream input_stream_for(const PluginLibrary &library) const;
+  device::Stream input_stream_for(const PluginLibrary &library) const;
   // Makes stream wait on device for the execution defining buffer; no host synchronization.
-  void wait_until_ready(const PluginLibrary &library, PJRT_Buffer *buffer, CUstream stream) const;
+  // Without streams, blocks until the buffer is ready.
+  void wait_until_ready(const PluginLibrary &library, PJRT_Buffer *buffer,
+                        device::Stream stream) const;
 
  private:
   PJRT_Client *client_ = nullptr;

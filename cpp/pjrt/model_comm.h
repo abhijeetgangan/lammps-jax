@@ -3,7 +3,7 @@
 #ifndef PJRT_MODEL_COMM_H
 #define PJRT_MODEL_COMM_H
 
-#include <cuda.h>
+#include "pjrt/device.h"
 
 #include <condition_variable>
 #include <cstdint>
@@ -52,7 +52,7 @@ class ModelComm {
   void begin_step(int nlocal, int nghost);
 
   // Exchange in place on device rows; pack_stream runs the pack/unpack kernels.
-  void set_device_rows(bool enabled, CUstream pack_stream)
+  void set_device_rows(bool enabled, device::Stream pack_stream)
   {
     device_rows_ = enabled;
     pack_stream_ = pack_stream;
@@ -65,7 +65,7 @@ class ModelComm {
   void service_loop();
 
   // Called from FFI threads; blocks until serviced. Empty on success, else a rank-identical error.
-  std::string comm_from_handler(bool forward, CUstream stream, const void *input,
+  std::string comm_from_handler(bool forward, device::Stream stream, const void *input,
                                 void *output, int64_t rows, int64_t width, size_t elem_bytes,
                                 const void *token_input, void *token_output);
 
@@ -84,18 +84,20 @@ class ModelComm {
 
   // Pinned staging shared by all sites, elem_bytes_ per feature; the token chain serializes them.
   void *pinned_ = nullptr;
-  CUevent staged_event_ = nullptr;
-  CUevent unpacked_event_ = nullptr;
+  device::Event staged_event_ = nullptr;
+  device::Event unpacked_event_ = nullptr;
 
   std::mutex mutex_;
   std::condition_variable condition_;
   ServiceCallback service_callback_;
   ModelCommRequest request_;
   bool request_pending_ = false;
+  // Set while a handler waits for service; a second one means the program's sites are unordered.
+  bool handler_active_ = false;
   std::string service_error_;
   bool servicing_ = false;
   bool device_rows_ = false;
-  CUstream pack_stream_ = nullptr;
+  device::Stream pack_stream_ = nullptr;
   bool done_ = false;
   int expected_requests_ = -1;
   int serviced_requests_ = 0;

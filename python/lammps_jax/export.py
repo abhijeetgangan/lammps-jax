@@ -372,7 +372,7 @@ def export_model(
                         else LammpsNeighborList(*model_args[4:n_fixed]))
         extra = (model_args[n_fixed],) if uses_box else ()
         if comm_obj is not None:
-            value = model_fn(positions, species, graph, *extra, comm_obj)
+            value = comm_obj.sequence(model_fn(positions, species, graph, *extra, comm_obj))
             comm_obj.validate()
         else:
             value = model_fn(positions, species, graph, *extra)
@@ -450,7 +450,14 @@ def export_model(
 
         force_program = jax.jit(export_forces)
         if energy_program is not None:
-            fused_program = jax.jit(lambda *a: (energy_program(*a), force_program(*a)))
+            def export_energy_and_forces(*model_args: Any) -> tuple[jax.Array, jax.Array]:
+                energy = energy_program(*model_args)
+                if comm:
+                    # Forces wait for the energy, so every rank runs the two exchange chains in order.
+                    model_args = (model_args[0] + 0.0 * energy, *model_args[1:])
+                return energy, force_program(*model_args)
+
+            fused_program = jax.jit(export_energy_and_forces)
     if force_program is None:
         raise AssertionError("validated export must have a force wrapper")
 

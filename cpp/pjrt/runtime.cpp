@@ -30,7 +30,7 @@ PJRT_Buffer_Type pjrt_type(ElementType type)
 
 BufferPtr create_input_view(const PluginLibrary &library, PJRT_Client *client,
                             PJRT_Device *device, const DeviceBufferSpec &spec,
-                            CUstream stream)
+                            device::Stream stream)
 {
   std::vector<int64_t> minor_to_major(spec.dims.size());
   for (size_t i = 0; i < spec.dims.size(); ++i)
@@ -60,14 +60,14 @@ BufferPtr create_input_view(const PluginLibrary &library, PJRT_Client *client,
   return BufferPtr(args.buffer, BufferDeleter{library.api()});
 }
 
-CUdeviceptr output_pointer(const PluginLibrary &library, PJRT_Buffer *buffer)
+device::Pointer output_pointer(const PluginLibrary &library, PJRT_Buffer *buffer)
 {
   PJRT_Buffer_OpaqueDeviceMemoryDataPointer_Args args{};
   args.struct_size = PJRT_Buffer_OpaqueDeviceMemoryDataPointer_Args_STRUCT_SIZE;
   args.buffer = buffer;
   library.check(library.api()->PJRT_Buffer_OpaqueDeviceMemoryDataPointer(&args),
                 "PJRT_Buffer_OpaqueDeviceMemoryDataPointer");
-  return reinterpret_cast<CUdeviceptr>(args.device_memory_ptr);
+  return reinterpret_cast<device::Pointer>(args.device_memory_ptr);
 }
 
 PJRT_Buffer_Type buffer_element_type(const PluginLibrary &library, PJRT_Buffer *buffer)
@@ -143,7 +143,7 @@ ExecutablePtr compile_program(const PluginLibrary &library, PJRT_Client *client,
 }
 
 ExecutionResult execute_loaded(const PluginLibrary &library, PJRT_Client *client,
-                               PJRT_Device *device, CUstream input_stream,
+                               PJRT_Device *device, device::Stream input_stream,
                                PJRT_LoadedExecutable *executable,
                                const ExecutionRequest &request, bool with_energy,
                                bool with_forces, OutputLifetime &output_lifetime,
@@ -160,8 +160,7 @@ ExecutionResult execute_loaded(const PluginLibrary &library, PJRT_Client *client
 
   const PJRT_Api *api = library.api();
   if (request.input_ready_event != nullptr)
-    check_cuda(cuStreamWaitEvent(input_stream, request.input_ready_event, 0),
-               "PJRT input stream wait");
+    device::wait_event(input_stream, request.input_ready_event);
 
   ExecutionResult result;
 
@@ -226,7 +225,8 @@ ExecutionResult execute_loaded(const PluginLibrary &library, PJRT_Client *client
   }
 
   if (force_output_index >= 0) {
-    const CUdeviceptr force_pointer = output_pointer(library, outputs[force_output_index].get());
+    const device::Pointer force_pointer =
+        output_pointer(library, outputs[force_output_index].get());
     output_lifetime.retain_force_output(std::move(outputs[force_output_index]), force_pointer);
   }
   if (on_enqueued) on_enqueued();
@@ -240,19 +240,17 @@ ExecutionResult execute_loaded(const PluginLibrary &library, PJRT_Client *client
   }
 
   if (energy_output_index >= 0) {
-    const CUdeviceptr energy_pointer =
+    const device::Pointer energy_pointer =
         output_pointer(library, outputs[energy_output_index].get());
     if (f64) {
       double energy = 0.0;
-      check_cuda(cuMemcpyDtoHAsync(&energy, energy_pointer, sizeof(double), request.stream),
-                 "copy energy");
-      check_cuda(cuStreamSynchronize(request.stream), "synchronize energy copy");
+      device::copy_to_host(&energy, energy_pointer, sizeof(double), request.stream);
+      device::synchronize(request.stream);
       result.energy = energy;
     } else {
       float energy = 0.0f;
-      check_cuda(cuMemcpyDtoHAsync(&energy, energy_pointer, sizeof(float), request.stream),
-                 "copy energy");
-      check_cuda(cuStreamSynchronize(request.stream), "synchronize energy copy");
+      device::copy_to_host(&energy, energy_pointer, sizeof(float), request.stream);
+      device::synchronize(request.stream);
       result.energy = static_cast<double>(energy);
     }
   }
@@ -347,9 +345,8 @@ ExecutionResult Runtime::run_on_worker(const ExecutionRequest &request,
     model_comm->begin_service(expected_sites);
   }
   // The worker starts without a CUDA context; adopt the caller's for the driver-API calls.
-  CUcontext cuda_context = nullptr;
-  cuCtxGetCurrent(&cuda_context);
-  std::packaged_task<ExecutionResult()> task([this, model_comm, execute, cuda_context]() {
+  const device::Context context = device::current_context();
+  std::packaged_task<ExecutionResult()> task([this, model_comm, execute, context]() {
     // Guard first: a throw before the marks would wedge service_loop and the caller's wait.
     // Marking inside the task orders it before the future becomes ready.
     struct DoneGuard {
@@ -361,8 +358,7 @@ ExecutionResult Runtime::run_on_worker(const ExecutionRequest &request,
         runtime->mark_finished();
       }
     } guard{this, model_comm};
-    if (cuda_context != nullptr)
-      check_cuda(cuCtxSetCurrent(cuda_context), "adopt CUDA context on the execution worker");
+    device::set_current_context(context);
     return execute();
   });
   auto future = task.get_future();
@@ -476,8 +472,8 @@ ExecutionResult Runtime::execute_energy_force(const ExecutionRequest &request)
   }, expected_sites(2), true);
 }
 
-void Runtime::consume_force_output(CUstream consumer_stream,
-                                   const std::function<void(CUdeviceptr)> &consumer)
+void Runtime::consume_force_output(device::Stream consumer_stream,
+                                   const std::function<void(device::Pointer)> &consumer)
 {
   // The consumer stream waits on device for the defining execution; no host round trip.
   if (PJRT_Buffer *buffer = output_lifetime_.pending_force_buffer())

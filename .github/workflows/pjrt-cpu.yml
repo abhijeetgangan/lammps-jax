@@ -1,0 +1,103 @@
+# Builds the pjrt-cpu/ wheel; a cold build times out, and "Re-run failed jobs" resumes it from cache.
+name: pjrt-cpu
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["pjrt-cpu-v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+
+      - name: XLA source
+        id: xla
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' pjrt-cpu/pyproject.toml)
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "pjrt-cpu-v$version" ]; then
+            echo "tag $GITHUB_REF_NAME does not match version $version" >&2
+            exit 1
+          fi
+          commit=$(curl -fsSL "https://raw.githubusercontent.com/jax-ml/jax/jax-v$version/MODULE.bazel" |
+            grep -o 'openxla/xla/archive/[0-9a-f]\{40\}' | head -1 | cut -d/ -f4)
+          test -n "$commit"
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          # / has about 14 GB free, too little for the build and its cache.
+          sudo install -d -o "$(id -u)" /mnt/bazel
+          printf 'startup --output_user_root=/mnt/bazel/root\nbuild --disk_cache=/mnt/bazel/disk\n' > ~/.bazelrc
+          curl -fsSL "https://github.com/openxla/xla/archive/$commit.tar.gz" | tar xz -C /mnt/bazel
+
+      - uses: actions/cache/restore@v4
+        with:
+          path: /mnt/bazel/disk
+          key: pjrt-cpu-${{ steps.xla.outputs.commit }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: pjrt-cpu-${{ steps.xla.outputs.commit }}-
+
+      - name: Build
+        id: build
+        timeout-minutes: 300
+        working-directory: /mnt/bazel/xla-${{ steps.xla.outputs.commit }}
+        run: |
+          python3 configure.py --backend=cpu --host_compiler=clang
+          bazelisk build -c opt --show_progress_rate_limit=60 //xla/pjrt/c:pjrt_c_api_cpu_plugin.so
+
+      - name: Stop Bazel
+        if: always() && steps.build.outcome != 'skipped'
+        working-directory: /mnt/bazel/xla-${{ steps.xla.outputs.commit }}
+        run: bazelisk shutdown
+
+      - uses: actions/cache/save@v4
+        if: always() && steps.build.outcome != 'skipped'
+        with:
+          path: /mnt/bazel/disk
+          key: pjrt-cpu-${{ steps.xla.outputs.commit }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Wheel
+        run: |
+          plugin=/mnt/bazel/xla-${{ steps.xla.outputs.commit }}/bazel-bin/xla/pjrt/c/pjrt_c_api_cpu_plugin.so
+          # The wheel tag promises glibc 2.27.
+          need=$(objdump -T "$plugin" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)
+          if [ "$(printf '%s\n' GLIBC_2.27 "$need" | sort -V | tail -1)" != GLIBC_2.27 ]; then
+            echo "the plugin needs $need, newer than the manylinux_2_27 tag" >&2
+            exit 1
+          fi
+          strip --strip-unneeded -o pjrt-cpu/lammps_jax_pjrt_cpu/pjrt_c_api_cpu_plugin.so "$plugin"
+          uv build --wheel --out-dir dist pjrt-cpu
+
+      - name: Smoke test
+        run: |
+          uv venv "$RUNNER_TEMP/smoke"
+          uv pip install --python "$RUNNER_TEMP/smoke" dist/*.whl
+          "$RUNNER_TEMP/smoke/bin/python" -c '
+          import ctypes, lammps_jax_pjrt_cpu as p
+          get_api = ctypes.CDLL(str(p.PLUGIN_PATH)).GetPjrtApi
+          get_api.restype = ctypes.c_void_p
+          assert get_api(), "GetPjrtApi returned null"
+          '
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel
+          path: dist/*.whl
+
+  publish:
+    if: github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-latest
+    # Needs a required reviewer here and a PyPI trusted publisher for this workflow.
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheel
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@release/v1

@@ -2,6 +2,7 @@
 
 Runs each deck on 1 and 2 MPI ranks against dense float64 references.
 Skipped unless LAMMPS_BIN, PJRT_PLUGIN, and LAMMPS_PLUGIN_PATH are set.
+LAMMPS_JAX_TEST_PLATFORM=cpu runs a host Kokkos LAMMPS with the CPU plugin.
 """
 
 import importlib.util
@@ -30,6 +31,8 @@ requires_lammps = pytest.mark.skipif(
     reason="set LAMMPS_BIN, PJRT_PLUGIN, and LAMMPS_PLUGIN_PATH to run "
            "the LAMMPS integration tests",
 )
+
+CPU = os.environ.get("LAMMPS_JAX_TEST_PLATFORM") == "cpu"
 
 MAX_RANK_FORCE_ERROR = 1.0e-5
 MAX_RANK_POSITION_ERROR = 1.0e-6
@@ -874,6 +877,8 @@ class LammpsRunner:
                     bundle_dir = Path(arguments[arguments.index("--bundle-dir") + 1])
                 if not (bundle_dir / "config.json").exists():
                     pytest.skip("converted MACE-MP bundle not available")
+            if CPU and (script == "export_eam_pallas.py" or "oeq" in arguments):
+                pytest.skip("Pallas and OpenEquivariance kernels run on CUDA only")
             if "oeq" in arguments and importlib.util.find_spec("openequivariance") is None:
                 pytest.skip("openequivariance not available")
             path = self.out_dir / f"{name}.lammps-jax.json"
@@ -893,7 +898,7 @@ class LammpsRunner:
         neigh = "half" if newton == "on" else "full"
         command += [
             self.lammps_bin,
-            "-k", "on", "g", "1",
+            "-k", "on", *(("t", "2") if CPU else ("g", "1")),
             "-sf", "kk",
             "-pk", "kokkos", "newton", newton, "neigh", neigh,
             "-log", "none",

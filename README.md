@@ -54,6 +54,32 @@ LAMMPS_PLUGIN_PATH=build-plugin-gpu-pjrt \
   -var pjrt /absolute/path/xla_cuda_plugin.so -in examples/in.lj_jax
 ```
 
+## CPU
+
+Kokkos OpenMP builds run the same bundles on the XLA CPU PJRT plugin from the
+`cpu` extra (Linux x86-64):
+
+```bash
+uv pip install -e '.[cpu]'
+python -c 'import lammps_jax_pjrt_cpu as p; print(p.PLUGIN_PATH)'
+```
+
+Build LAMMPS with `-C cmake/presets/kokkos-openmp.cmake -D PKG_PLUGIN=on
+-D BUILD_MPI=on -D Kokkos_ENABLE_IMPL_VIEW_LEGACY=on` and the plugin as above
+against that build, without `CMAKE_CXX_COMPILER`. One MPI rank per core runs
+fastest:
+
+```bash
+python examples/export_model.py eam cuzr.lammps-jax.json \
+  --setfl examples/potentials/CuZr.eam.alloy.gz \
+  --max-atoms 8192 --edges-per-atom 128 --precision float64
+LAMMPS_PLUGIN_PATH=build-plugin-cpu-pjrt \
+  mpirun -np 4 "$LAMMPS_CPU_INSTALL/bin/lmp" -k on t 1 -sf kk -pk kokkos newton on neigh half \
+  -var pjrt /absolute/path/pjrt_c_api_cpu_plugin.so -in examples/in.eam_cuzr
+```
+
+cuEquivariance and OpenEquivariance kernels are CUDA only.
+
 ## Test
 
 ```bash
@@ -68,6 +94,8 @@ PJRT_PLUGIN=/absolute/path/xla_cuda_plugin.so \
 LAMMPS_PLUGIN_PATH=$PWD/build-plugin-gpu-pjrt \
   python -m pytest tests/test_lammps.py -v
 ```
+
+For a host Kokkos LAMMPS and the CPU plugin, add `LAMMPS_JAX_TEST_PLATFORM=cpu`.
 
 ## Design notes
 

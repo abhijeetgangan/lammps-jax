@@ -12,9 +12,6 @@ namespace pjrt {
 // non-null, destroying the error object first.
 void check(const PJRT_Api *api, PJRT_Error *error, const std::string &operation);
 
-// Throws std::runtime_error for CUDA driver failures, with name and message.
-void check_cuda(int cu_result, const std::string &operation);
-
 struct BufferDeleter {
   const PJRT_Api *api = nullptr;
   void operator()(PJRT_Buffer *buffer) const;

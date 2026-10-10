@@ -1,5 +1,7 @@
 #include "pjrt/client_session.h"
 
+#include "pjrt/handles.h"
+
 #include <cstring>
 #include <stdexcept>
 #include <vector>
@@ -63,6 +65,7 @@ void ClientSession::initialize(const PluginLibrary &library, const ClientOptions
     throw std::runtime_error("PJRT client has no addressable devices");
   device_ = device_args.addressable_devices[0];
 
+  if (!device::has_streams()) return;
   stream_extension_ = reinterpret_cast<PJRT_Stream_Extension_Local *>(
       library.find_extension(PJRT_Extension_Type_Stream));
   if (stream_extension_ == nullptr || stream_extension_->get_stream == nullptr ||
@@ -84,8 +87,9 @@ void ClientSession::close(const PluginLibrary &library)
   client_ = nullptr;
 }
 
-CUstream ClientSession::input_stream_for(const PluginLibrary &library) const
+device::Stream ClientSession::input_stream_for(const PluginLibrary &library) const
 {
+  if (!device::has_streams()) return nullptr;
   if (stream_extension_ == nullptr || device_ == nullptr)
     throw std::runtime_error("PJRT client session is not initialized");
   PJRT_Get_Stream_For_External_Ready_Events_Args_Local args{};
@@ -93,12 +97,25 @@ CUstream ClientSession::input_stream_for(const PluginLibrary &library) const
   args.device = device_;
   library.check(stream_extension_->get_stream(&args),
                 "PJRT_Get_Stream_For_External_Ready_Events");
-  return reinterpret_cast<CUstream>(args.stream);
+  return reinterpret_cast<device::Stream>(args.stream);
 }
 
 void ClientSession::wait_until_ready(const PluginLibrary &library, PJRT_Buffer *buffer,
-                                     CUstream stream) const
+                                     device::Stream stream) const
 {
+  if (!device::has_streams()) {
+    const PJRT_Api *api = library.api();
+    PJRT_Buffer_ReadyEvent_Args ready{};
+    ready.struct_size = PJRT_Buffer_ReadyEvent_Args_STRUCT_SIZE;
+    ready.buffer = buffer;
+    library.check(api->PJRT_Buffer_ReadyEvent(&ready), "PJRT_Buffer_ReadyEvent");
+    const EventPtr event(ready.event, EventDeleter{api});
+    PJRT_Event_Await_Args await{};
+    await.struct_size = PJRT_Event_Await_Args_STRUCT_SIZE;
+    await.event = event.get();
+    library.check(api->PJRT_Event_Await(&await), "PJRT execution");
+    return;
+  }
   PJRT_Wait_Until_Buffer_Ready_On_Stream_Args_Local args{};
   args.struct_size = sizeof(PJRT_Wait_Until_Buffer_Ready_On_Stream_Args_Local);
   args.stream = reinterpret_cast<intptr_t>(stream);

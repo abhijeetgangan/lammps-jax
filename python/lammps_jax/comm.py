@@ -237,6 +237,14 @@ class Comm:
             )
         return jax.tree.unflatten(treedef, pieces)
 
+    def sequence(self, value: Any) -> Any:
+        """Add zero times the squared final token to value, so its gradient orders exchanges."""
+        if not self.enabled or self.token is None:
+            return value
+        tail = 0.0 * self.token * self.token
+        return jax.tree.map(
+            lambda leaf: leaf + tail.astype(jnp.result_type(leaf)), value)
+
     def validate(self) -> None:
         """Check that the trace visited a prefix of the declared schedule in order.
 

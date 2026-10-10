@@ -1,0 +1,22 @@
+# Released apart from lammps-jax by .github/workflows/pjrt-cpu.yml; the version is jaxlib's.
+[project]
+name = "lammps-jax-pjrt-cpu"
+version = "0.10.1"
+description = "XLA CPU PJRT plugin for pair_style jax/kk on host Kokkos builds of LAMMPS"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES"]
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["lammps_jax_pjrt_cpu"]
+
+[tool.setuptools.package-data]
+lammps_jax_pjrt_cpu = ["pjrt_c_api_cpu_plugin.so"]
+
+# A package without extension modules gets a platform tag only when given one.
+[tool.distutils.bdist_wheel]
+plat_name = "manylinux_2_27_x86_64"

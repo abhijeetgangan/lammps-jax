@@ -58,7 +58,7 @@ namespace {
 
 ffi::Error model_comm_impl(bool forward, ffi::AnyBuffer features, ffi::AnyBuffer token,
                               ffi::Result<ffi::AnyBuffer> features_out,
-                              ffi::Result<ffi::AnyBuffer> token_out, CUstream stream,
+                              ffi::Result<ffi::AnyBuffer> token_out, device::Stream stream,
                               ModelCommUserData *user_data)
 {
   if (user_data == nullptr || user_data->exchange == nullptr)
@@ -92,7 +92,7 @@ ffi::Error model_comm_impl(bool forward, ffi::AnyBuffer features, ffi::AnyBuffer
 
 ffi::Error forward_comm_impl(ffi::AnyBuffer features, ffi::AnyBuffer token,
                              ffi::Result<ffi::AnyBuffer> features_out,
-                             ffi::Result<ffi::AnyBuffer> token_out, CUstream stream,
+                             ffi::Result<ffi::AnyBuffer> token_out, device::Stream stream,
                              ModelCommUserData *user_data)
 {
   return model_comm_impl(true, features, token, features_out, token_out, stream, user_data);
@@ -100,7 +100,7 @@ ffi::Error forward_comm_impl(ffi::AnyBuffer features, ffi::AnyBuffer token,
 
 ffi::Error reverse_comm_impl(ffi::AnyBuffer features, ffi::AnyBuffer token,
                              ffi::Result<ffi::AnyBuffer> features_out,
-                             ffi::Result<ffi::AnyBuffer> token_out, CUstream stream,
+                             ffi::Result<ffi::AnyBuffer> token_out, device::Stream stream,
                              ModelCommUserData *user_data)
 {
   return model_comm_impl(false, features, token, features_out, token_out, stream, user_data);
@@ -112,7 +112,7 @@ XLA_FFI_DEFINE_HANDLER(kForwardCommHandler, forward_comm_impl,
                            .Arg<ffi::AnyBuffer>()
                            .Ret<ffi::AnyBuffer>()
                            .Ret<ffi::AnyBuffer>()
-                           .Ctx<ffi::PlatformStream<CUstream>>()
+                           .Ctx<ffi::PlatformStream<device::Stream>>()
                            .Ctx<ffi::UserData<ModelCommUserData>>());
 
 XLA_FFI_DEFINE_HANDLER(kReverseCommHandler, reverse_comm_impl,
@@ -121,7 +121,40 @@ XLA_FFI_DEFINE_HANDLER(kReverseCommHandler, reverse_comm_impl,
                            .Arg<ffi::AnyBuffer>()
                            .Ret<ffi::AnyBuffer>()
                            .Ret<ffi::AnyBuffer>()
-                           .Ctx<ffi::PlatformStream<CUstream>>()
+                           .Ctx<ffi::PlatformStream<device::Stream>>()
+                           .Ctx<ffi::UserData<ModelCommUserData>>());
+
+// The host runtime has no platform stream, so its handlers bind none.
+ffi::Error forward_host_comm_impl(ffi::AnyBuffer features, ffi::AnyBuffer token,
+                                  ffi::Result<ffi::AnyBuffer> features_out,
+                                  ffi::Result<ffi::AnyBuffer> token_out,
+                                  ModelCommUserData *user_data)
+{
+  return model_comm_impl(true, features, token, features_out, token_out, nullptr, user_data);
+}
+
+ffi::Error reverse_host_comm_impl(ffi::AnyBuffer features, ffi::AnyBuffer token,
+                                  ffi::Result<ffi::AnyBuffer> features_out,
+                                  ffi::Result<ffi::AnyBuffer> token_out,
+                                  ModelCommUserData *user_data)
+{
+  return model_comm_impl(false, features, token, features_out, token_out, nullptr, user_data);
+}
+
+XLA_FFI_DEFINE_HANDLER(kForwardHostCommHandler, forward_host_comm_impl,
+                       ffi::Ffi::Bind()
+                           .Arg<ffi::AnyBuffer>()
+                           .Arg<ffi::AnyBuffer>()
+                           .Ret<ffi::AnyBuffer>()
+                           .Ret<ffi::AnyBuffer>()
+                           .Ctx<ffi::UserData<ModelCommUserData>>());
+
+XLA_FFI_DEFINE_HANDLER(kReverseHostCommHandler, reverse_host_comm_impl,
+                       ffi::Ffi::Bind()
+                           .Arg<ffi::AnyBuffer>()
+                           .Arg<ffi::AnyBuffer>()
+                           .Ret<ffi::AnyBuffer>()
+                           .Ret<ffi::AnyBuffer>()
                            .Ctx<ffi::UserData<ModelCommUserData>>());
 
 } // namespace
@@ -181,9 +214,11 @@ void ModelComm::initialize(const PJRT_Api *api, int max_atoms, const std::vector
       void *handler;
     } handlers[] = {
         {kForwardTarget, sizeof(kForwardTarget) - 1,
-         reinterpret_cast<void *>(kForwardCommHandler)},
+         reinterpret_cast<void *>(device::has_streams() ? kForwardCommHandler
+                                                        : kForwardHostCommHandler)},
         {kReverseTarget, sizeof(kReverseTarget) - 1,
-         reinterpret_cast<void *>(kReverseCommHandler)},
+         reinterpret_cast<void *>(device::has_streams() ? kReverseCommHandler
+                                                        : kReverseHostCommHandler)},
     };
     for (const auto &entry : handlers) {
       PJRT_FFI_Register_Handler_Args handler_args{};
@@ -191,8 +226,8 @@ void ModelComm::initialize(const PJRT_Api *api, int max_atoms, const std::vector
       handler_args.target_name = entry.name;
       handler_args.target_name_size = entry.name_size;
       handler_args.handler = entry.handler;
-      handler_args.platform_name = "CUDA";
-      handler_args.platform_name_size = 4;
+      handler_args.platform_name = device::platform_name();
+      handler_args.platform_name_size = std::strlen(device::platform_name());
       handler_args.traits = static_cast<PJRT_FFI_Handler_TraitsBits>(0);
       if (PJRT_Error *error = extension->register_handler(&handler_args)) {
         PJRT_Error_Destroy_Args destroy{PJRT_Error_Destroy_Args_STRUCT_SIZE, nullptr, error};
@@ -229,13 +264,9 @@ void ModelComm::initialize(const PJRT_Api *api, int max_atoms, const std::vector
   }
 
   const int max_width = *std::max_element(widths_.begin(), widths_.end());
-  check_cuda(cuMemHostAlloc(&pinned_,
-                            static_cast<size_t>(max_atoms_) * max_width * elem_bytes_, 0),
-             "allocate pinned model comm staging");
-  check_cuda(cuEventCreate(&staged_event_, CU_EVENT_DISABLE_TIMING),
-             "create model comm staging event");
-  check_cuda(cuEventCreate(&unpacked_event_, CU_EVENT_DISABLE_TIMING),
-             "create model comm unpack event");
+  pinned_ = device::allocate_pinned(static_cast<size_t>(max_atoms_) * max_width * elem_bytes_);
+  staged_event_ = device::create_event();
+  unpacked_event_ = device::create_event();
 }
 
 void ModelComm::close(const PJRT_Api *api)
@@ -252,18 +283,12 @@ void ModelComm::close(const PJRT_Api *api)
   execute_context_ = nullptr;
   delete user_data_;
   user_data_ = nullptr;
-  if (pinned_ != nullptr) {
-    cuMemFreeHost(pinned_);
-    pinned_ = nullptr;
-  }
-  if (staged_event_ != nullptr) {
-    cuEventDestroy(staged_event_);
-    staged_event_ = nullptr;
-  }
-  if (unpacked_event_ != nullptr) {
-    cuEventDestroy(unpacked_event_);
-    unpacked_event_ = nullptr;
-  }
+  device::free_pinned(pinned_);
+  pinned_ = nullptr;
+  device::destroy_event(staged_event_);
+  staged_event_ = nullptr;
+  device::destroy_event(unpacked_event_);
+  unpacked_event_ = nullptr;
   api_ = nullptr;
 }
 
@@ -291,6 +316,7 @@ void ModelComm::begin_service(int expected_requests)
   service_error_.clear();
   forward_site_ = 0;
   reverse_site_ = 0;
+  handler_active_ = false;
 }
 
 void ModelComm::mark_execution_done()
@@ -363,7 +389,7 @@ std::string ModelComm::validate_site(bool forward, int64_t rows, int64_t width,
   return "";
 }
 
-std::string ModelComm::comm_from_handler(bool forward, CUstream stream, const void *input,
+std::string ModelComm::comm_from_handler(bool forward, device::Stream stream, const void *input,
                                          void *output, int64_t rows, int64_t width,
                                          size_t elem_bytes, const void *token_input,
                                          void *token_output)
@@ -371,13 +397,18 @@ std::string ModelComm::comm_from_handler(bool forward, CUstream stream, const vo
   int nlocal = 0;
   int nghost = 0;
   bool device = false;
-  CUstream pack_stream = nullptr;
+  device::Stream pack_stream = nullptr;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!servicing_)
       return "model comm invoked outside a serviced execution";
+    // Ranks must exchange in one order; overlapping sites would race for the request slot.
+    if (handler_active_)
+      return "model comm sites ran concurrently; re-export the bundle so its exchanges form "
+             "one token chain";
     const std::string error = validate_site(forward, rows, width, elem_bytes);
     if (!error.empty()) return error;
+    handler_active_ = true;
     nlocal = nlocal_;
     nghost = nghost_;
     device = device_rows_;
@@ -385,26 +416,22 @@ std::string ModelComm::comm_from_handler(bool forward, CUstream stream, const vo
   }
 
   const size_t row_bytes = static_cast<size_t>(width) * elem_bytes;
-  const CUdeviceptr input_ptr = reinterpret_cast<CUdeviceptr>(input);
-  const CUdeviceptr output_ptr = reinterpret_cast<CUdeviceptr>(output);
+  const device::Pointer input_ptr = reinterpret_cast<device::Pointer>(input);
+  const device::Pointer output_ptr = reinterpret_cast<device::Pointer>(output);
 
   // Aliasing normally returns the same buffer; the identity copy covers distinct ones.
   if (input != output)
-    check_cuda(cuMemcpyDtoDAsync(output_ptr, input_ptr, static_cast<size_t>(rows) * row_bytes,
-                                 stream),
-               "model comm identity copy");
+    device::copy_on_device(output_ptr, input_ptr, static_cast<size_t>(rows) * row_bytes, stream);
   // Forward sends owned rows; reverse sends owned and ghost adjoint rows.
   const int staged_rows = forward ? nlocal : nlocal + nghost;
   if (!device && staged_rows > 0)
-    check_cuda(cuMemcpyDtoHAsync(pinned_, input_ptr, static_cast<size_t>(staged_rows) * row_bytes,
-                                 stream),
-               "model comm stage to host");
-  check_cuda(cuEventRecord(staged_event_, stream), "model comm staging event record");
+    device::copy_to_host(pinned_, input_ptr, static_cast<size_t>(staged_rows) * row_bytes, stream);
+  device::record_event(staged_event_, stream);
   // Pinned staging must drain to the host; device rows order on the stream.
   if (device)
-    check_cuda(cuStreamWaitEvent(pack_stream, staged_event_, 0), "model comm staging order");
+    device::wait_event(pack_stream, staged_event_);
   else
-    check_cuda(cuEventSynchronize(staged_event_), "model comm staging event wait");
+    device::synchronize_event(staged_event_);
 
   {
     std::unique_lock<std::mutex> lock(mutex_);
@@ -413,39 +440,34 @@ std::string ModelComm::comm_from_handler(bool forward, CUstream stream, const vo
     request_pending_ = true;
     condition_.notify_all();
     condition_.wait(lock, [&] { return !request_pending_; });
+    handler_active_ = false;
     if (!service_error_.empty()) return service_error_;
   }
 
   // The service enqueued its unpack on pack_stream; execution resumes after it.
   if (device) {
-    check_cuda(cuEventRecord(unpacked_event_, pack_stream), "model comm unpack event record");
-    check_cuda(cuStreamWaitEvent(stream, unpacked_event_, 0), "model comm unpack order");
+    device::record_event(unpacked_event_, pack_stream);
+    device::wait_event(stream, unpacked_event_);
   }
 
   if (forward) {
     if (!device && nghost > 0)
-      check_cuda(cuMemcpyHtoDAsync(output_ptr + static_cast<size_t>(nlocal) * row_bytes,
-                                   static_cast<unsigned char *>(pinned_) +
-                                       static_cast<size_t>(nlocal) * row_bytes,
-                                   static_cast<size_t>(nghost) * row_bytes, stream),
-                 "model comm ghost rows to device");
+      device::copy_to_device(output_ptr + static_cast<size_t>(nlocal) * row_bytes,
+                             static_cast<unsigned char *>(pinned_) +
+                                 static_cast<size_t>(nlocal) * row_bytes,
+                             static_cast<size_t>(nghost) * row_bytes, stream);
   } else {
     if (!device && nlocal > 0)
-      check_cuda(cuMemcpyHtoDAsync(output_ptr, pinned_,
-                                   static_cast<size_t>(nlocal) * row_bytes, stream),
-                 "model comm owner adjoints to device");
+      device::copy_to_device(output_ptr, pinned_, static_cast<size_t>(nlocal) * row_bytes, stream);
     // Forwarded ghost cotangents vanish locally; padding keeps the identity copy, zero when masked.
     if (nghost > 0)
-      check_cuda(cuMemsetD8Async(output_ptr + static_cast<size_t>(nlocal) * row_bytes, 0,
-                                 static_cast<size_t>(nghost) * row_bytes, stream),
-                 "model comm ghost adjoint zero");
+      device::zero(output_ptr + static_cast<size_t>(nlocal) * row_bytes,
+                   static_cast<size_t>(nghost) * row_bytes, stream);
   }
   // Enqueued last: the token releases the next site only after the copies above.
   if (token_output != token_input)
-    check_cuda(cuMemcpyDtoDAsync(reinterpret_cast<CUdeviceptr>(token_output),
-                                 reinterpret_cast<CUdeviceptr>(token_input), sizeof(float),
-                                 stream),
-               "model comm token copy");
+    device::copy_on_device(reinterpret_cast<device::Pointer>(token_output),
+                           reinterpret_cast<device::Pointer>(token_input), sizeof(float), stream);
   return "";
 }
 
