@@ -38,12 +38,14 @@ void ClientSession::initialize(const PluginLibrary &library, const ClientOptions
   std::vector<PJRT_NamedValue> create_options;
   PJRT_NamedValue visible = named_option("visible_devices", PJRT_NamedValue_kInt64List);
   visible.int64_array_value = &visible_device;
-  create_options.push_back(visible);
   PJRT_NamedValue preallocate = named_option("preallocate", PJRT_NamedValue_kBool);
   preallocate.bool_value = false;
-  create_options.push_back(preallocate);
+  if (options.gpu) {  // unknown options are an error in XLA's CPU plugin
+    create_options.push_back(visible);
+    create_options.push_back(preallocate);
+  }
   PJRT_NamedValue memory_fraction = named_option("memory_fraction", PJRT_NamedValue_kFloat);
-  if (options.memory_fraction > 0.0) {
+  if (options.gpu && options.memory_fraction > 0.0) {
     memory_fraction.float_value = static_cast<float>(options.memory_fraction);
     create_options.push_back(memory_fraction);
   }

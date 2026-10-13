@@ -13,6 +13,7 @@ namespace pjrt {
 struct ClientOptions {
   int visible_device = 0;        // CUDA device ordinal this client may use
   double memory_fraction = 0.0;  // 0 keeps the plugin default
+  bool gpu = true;               // device options: XLA's CPU plugin rejects them
 };
 
 // Owns the PJRT client and the single CUDA device visible to this LAMMPS rank.

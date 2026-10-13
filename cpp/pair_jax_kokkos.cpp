@@ -609,6 +609,8 @@ void PairJaxKokkos::coeff(int narg, char **arg)
     pjrt::ClientOptions client_options;
 #ifdef KOKKOS_ENABLE_CUDA
     client_options.visible_device = exec.cuda_device();
+#else
+    client_options.gpu = false;
 #endif
     if (const char *fraction = std::getenv("LAMMPS_JAX_MEM_FRACTION"))
       client_options.memory_fraction = std::atof(fraction);
