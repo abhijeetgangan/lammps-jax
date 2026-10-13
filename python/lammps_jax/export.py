@@ -230,6 +230,7 @@ def export_model(
     n_species: int | None = None,
     max_owned: int | None = None,
     pair_sum: bool = False,
+    platform: str = "cuda",
 ) -> dict[str, Any]:
     """Export a JAX model to a fixed-capacity LAMMPS-JAX JSON bundle.
 
@@ -237,6 +238,9 @@ def export_model(
     the negative position gradient of the summed energy. max_edges selects the
     sparse edge layout, max_neighbors the slot-major neighbor matrix with that
     many slots per row; rows are max_owned when given, else max_atoms.
+    platform ("cuda" or "cpu") is the PJRT plugin the bundle will run on: some
+    primitives lower differently per platform (a cumsum lowered for cuda aborts
+    XLA's CPU compiler).
     """
     if energy_fn is None and force_fn is None:
         raise ValueError("provide energy_fn or force_fn")
@@ -500,7 +504,7 @@ def export_model(
             return ""
         # Highest matmul precision: TF32 dot_generals would soften forces.
         with jax.default_matmul_precision("highest"):
-            exported = jax.export.export(fn, platforms=("cuda",), disabled_checks=disabled_checks)(  # ty: ignore[invalid-argument-type]
+            exported = jax.export.export(fn, platforms=(platform,), disabled_checks=disabled_checks)(  # ty: ignore[invalid-argument-type]
                 *args
             )
         comm_sites.append(check_exchange_widths(exported))
@@ -525,6 +529,7 @@ def export_model(
         },
         "export_info": {
             "jax_version": jax.__version__,
+            "platform": platform,
         },
         "compile_options_b64": base64.b64encode(
             strip_debug_options(compile_options.SerializeAsString())).decode("ascii"),
