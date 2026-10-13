@@ -158,6 +158,8 @@ def test_export_model_records_platform(tmp_path):
     cpu = export_and_load(tmp_path / "cpu.json", platform="cpu", **kwargs)
     assert cuda["export_info"]["platform"] == "cuda"
     assert cpu["export_info"]["platform"] == "cpu"
+    with pytest.raises(ValueError, match="platform"):
+        export_and_load(tmp_path / "gpu.json", platform="gpu", **kwargs)
 
 
 def test_export_model_accepts_force_fn(tmp_path):

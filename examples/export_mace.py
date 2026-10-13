@@ -415,6 +415,7 @@ def run_export(args):
         max_owned=args.owned_rows,
         custom_call_targets=targets,
         n_species=n_types,
+        platform=args.platform,
     )
     contract = json.load(open(args.output))["contract"]
     print(f"exported: targets={contract['custom_call_targets']} -> {args.output}")
@@ -468,6 +469,9 @@ def main():
     exporter.add_argument("--owned-rows", type=int, default=None,
                           help="Static owned-row bound; the product basis "
                                "skips ghost rows. Comm mode only.")
+    exporter.add_argument("--platform", choices=("cuda", "cpu"), default="cuda",
+                          help="PJRT plugin the bundle runs on; some primitives lower "
+                               "differently per platform")
     exporter.add_argument("--skip-check", action="store_true",
                         help="skip the adapter-vs-mace_jax parity preflight")
     converter = sub.add_parser("convert", help="torch checkpoint to a mace-jax bundle dir")

@@ -85,6 +85,10 @@ EXPORTS = {
                        "--half-edges")),
     "eam_small": ("export_model.py",
                   ("eam", "{output}", "--max-atoms", "512", "--edges-per-atom", "64")),
+    # Lowered for the platform the run does not use; pair_coeff must reject it.
+    "eam_other_platform": ("export_model.py",
+                           ("eam", "{output}", "--max-atoms", "512", "--edges-per-atom", "64",
+                            "--platform", "cuda" if CPU else "cpu")),
     "mace_comm": ("export_mace.py",
                   ("export", "plain", "{output}", "--mode", "comm", "--type-z", "13",
                    "--max-atoms", "2048", "--edges-per-atom", "16",
@@ -444,6 +448,8 @@ NEGATIVE_CONTROLS = {
                            message="exported for newton pair on"),
     "eam_capacity": dict(bundle="eam_small", newton="on", variables={},
                          message="capacity exceeded"),
+    "eam_platform": dict(bundle="eam_other_platform", newton="on", variables={},
+                         message="re-export it with platform"),
     "cuzr_species": dict(bundle="cuzr", newton="on", variables={},
                          deck="cuzr_types3_static",
                          message="distinguishes 2 species"),
@@ -886,6 +892,8 @@ class LammpsRunner:
             env["JAX_ENABLE_X64"] = "0"
             command = [sys.executable, REPO_ROOT / "examples" / script]
             command += [path if arg == "{output}" else arg for arg in arguments]
+            if CPU and "--platform" not in arguments:
+                command += ["--platform", "cpu"]
             self.run(f"export_{name}", command, env=env)
             self.bundles[name] = path
         return self.bundles[name]

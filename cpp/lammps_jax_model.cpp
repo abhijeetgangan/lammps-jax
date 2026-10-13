@@ -220,6 +220,9 @@ ModelBundle load_bundle_file(const std::string &path)
   bundle.programs.energy_mlir = get_program(json, "energy_mlir");
   bundle.programs.energy_and_forces_mlir = get_program(json, "energy_and_forces_mlir");
   bundle.compile_options = decode_base64(get_string(json, "compile_options_b64"));
+  // export_info.platform; bundles exported before it were lowered for cuda.
+  if (json.find("\"platform\"") != std::string::npos)
+    bundle.platform = get_string(json, "platform");
   // Sorted keys put "contract" before the program blobs; first-match lookup never reads them.
   bundle.contract.input_layout = parse_input_layout(get_string(json, "input_layout"));
   bundle.contract.max_atoms = static_cast<int>(get_number(json, "max_atoms"));

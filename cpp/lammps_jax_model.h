@@ -81,6 +81,8 @@ struct ModelBundle {
   ProgramSet programs;
   // Serialized xla.CompileOptions proto, handed to PJRT_Client_Compile unchanged.
   std::string compile_options;
+  // jax.export lowering platform, "cuda" or "cpu"; pair_coeff rejects the other build's.
+  std::string platform = "cuda";
   ModelContract contract;
 };
 

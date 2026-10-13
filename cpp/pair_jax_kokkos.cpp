@@ -604,6 +604,15 @@ void PairJaxKokkos::coeff(int narg, char **arg)
                "LAMMPS-JAX model distinguishes {} species but the system defines {} atom "
                "types; types beyond the model's range would silently map to its last species",
                bundle.contract.n_species, atom->ntypes);
+  // XLA aborts on programs lowered for another platform.
+#ifdef KOKKOS_ENABLE_CUDA
+  const char *platform = "cuda";
+#else
+  const char *platform = "cpu";
+#endif
+  if (bundle.platform != platform)
+    error->all(FLERR, "LAMMPS-JAX model was exported for {} but this build runs {}; re-export "
+               "it with platform=\"{}\"", bundle.platform, platform, platform);
 
   try {
     pjrt::ClientOptions client_options;

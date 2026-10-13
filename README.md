@@ -56,8 +56,8 @@ LAMMPS_PLUGIN_PATH=build-plugin-gpu-pjrt \
 
 ## CPU
 
-Kokkos OpenMP builds run the same bundles on the XLA CPU PJRT plugin from the
-`cpu` extra (Linux x86-64):
+Kokkos OpenMP builds run bundles exported with `platform="cpu"` on the XLA CPU
+PJRT plugin from the `cpu` extra (Linux x86-64):
 
 ```bash
 uv pip install -e '.[cpu]'
@@ -72,7 +72,7 @@ fastest:
 ```bash
 python examples/export_model.py eam cuzr.lammps-jax.json \
   --setfl examples/potentials/CuZr.eam.alloy.gz \
-  --max-atoms 8192 --edges-per-atom 128 --precision float64
+  --max-atoms 8192 --edges-per-atom 128 --precision float64 --platform cpu
 LAMMPS_PLUGIN_PATH=build-plugin-cpu-pjrt \
   mpirun -np 4 "$LAMMPS_CPU_INSTALL/bin/lmp" -k on t 1 -sf kk -pk kokkos newton on neigh half \
   -var pjrt /absolute/path/pjrt_c_api_cpu_plugin.so -in examples/in.eam_cuzr

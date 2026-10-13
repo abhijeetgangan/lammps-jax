@@ -266,6 +266,8 @@ def export_model(
                          "style hands the model the LAMMPS half list as is")
     if newton not in {"on", "off", "any"}:
         raise ValueError("newton must be 'on', 'off', or 'any'")
+    if platform not in {"cuda", "cpu"}:
+        raise ValueError("platform must be 'cuda' or 'cpu'")
     if precision not in PRECISIONS:
         raise ValueError(f"precision must be one of {list(PRECISIONS)}")
     if n_species is not None and n_species < 1:

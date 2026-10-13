@@ -95,6 +95,12 @@ def add_shared_arguments(parser, *, max_atoms, edges_per_atom):
         default="float32",
         help="Floating-point ABI of the exported programs.",
     )
+    parser.add_argument(
+        "--platform",
+        choices=("cuda", "cpu"),
+        default="cuda",
+        help="PJRT plugin the bundle runs on; some primitives lower differently per platform.",
+    )
 
 
 def export_lj(args, max_edges):
@@ -139,6 +145,7 @@ def export_lj(args, max_edges):
         newton=args.newton,
         force_output="edge-force" if args.force_output == "edge" else "atom-force",
         uses_box=args.uses_box,
+        platform=args.platform,
     )
 
 
@@ -202,6 +209,7 @@ def export_eam(args, max_edges, parser):
         n_hops=n_hops,
         half_edges=args.half_edges,
         n_species=n_species,
+        platform=args.platform,
     )
 
 
