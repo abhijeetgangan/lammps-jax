@@ -145,6 +145,21 @@ def test_export_model_records_n_species(tmp_path):
         )
 
 
+def test_export_model_records_platform(tmp_path):
+    """platform= picks the PJRT plugin the program is lowered for; the bundle records it."""
+    kwargs = {
+        "energy_fn": pair_energy,
+        "max_atoms": 4,
+        "max_edges": 6,
+        "cutoff": 2.0,
+        "unit_style": "lj",
+    }
+    cuda = export_and_load(tmp_path / "cuda.json", **kwargs)
+    cpu = export_and_load(tmp_path / "cpu.json", platform="cpu", **kwargs)
+    assert cuda["export_info"]["platform"] == "cuda"
+    assert cpu["export_info"]["platform"] == "cpu"
+
+
 def test_export_model_accepts_force_fn(tmp_path):
     data = export_and_load(
         tmp_path / "force-model.json",
