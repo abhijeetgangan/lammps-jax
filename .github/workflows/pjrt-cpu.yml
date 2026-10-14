@@ -25,6 +25,10 @@ jobs:
             echo "tag $GITHUB_REF_NAME does not match version $version" >&2
             exit 1
           fi
+          if ! grep -q "\"jax<=$version\"" pjrt-cpu/pyproject.toml; then
+            echo "pjrt-cpu/pyproject.toml must require jax<=$version" >&2
+            exit 1
+          fi
           commit=$(curl -fsSL "https://raw.githubusercontent.com/jax-ml/jax/jax-v$version/MODULE.bazel" |
             grep -o 'openxla/xla/archive/[0-9a-f]\{40\}' | head -1 | cut -d/ -f4)
           test -n "$commit"

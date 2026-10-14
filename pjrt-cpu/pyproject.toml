@@ -1,11 +1,12 @@
 # Released apart from lammps-jax by .github/workflows/pjrt-cpu.yml; the version is jaxlib's.
 [project]
 name = "lammps-jax-pjrt-cpu"
-version = "0.10.1"
+version = "0.11.2"
 description = "XLA CPU PJRT plugin for pair_style jax/kk on host Kokkos builds of LAMMPS"
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE", "THIRD_PARTY_NOTICES"]
+dependencies = ["jax<=0.11.2"]
 
 [build-system]
 requires = ["setuptools>=77"]

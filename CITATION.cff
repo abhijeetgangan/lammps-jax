@@ -9,8 +9,8 @@ authors:
     given-names: William C.
   - family-names: Kotak
     given-names: Mit
-version: 0.1.0
-date-released: 2026-06-24
+version: 0.2.0
+date-released: 2026-10-13
 repository-code: https://github.com/abhijeetgangan/lammps-jax
 doi: 10.5281/zenodo.20838694
 license: MIT
