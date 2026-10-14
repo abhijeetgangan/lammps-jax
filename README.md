@@ -7,7 +7,18 @@
 
 ## Setup
 
+The Python package is on PyPI; the LAMMPS plugin and the examples build from
+this repository.
+
 ```bash
+pip install lammps-jax 'jax[cuda12]'  # GPU
+pip install 'lammps-jax[cpu]'         # CPU, with the XLA CPU PJRT plugin
+```
+
+From a checkout:
+
+```bash
+git clone https://github.com/abhijeetgangan/lammps-jax && cd lammps-jax
 uv venv .venv --python python3
 source .venv/bin/activate
 uv pip install -e '.[test]'

@@ -30,8 +30,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
       - run: uv venv .venv --python 3.13
-      # jax 0.11.2 segfaults compiling ghost_exchange.redistribute on CPU; 0.11.1 passes.
-      - run: uv pip install -e '.[dist,test]' 'jax!=0.11.2'
+      - run: uv pip install -e '.[dist,test]'
       - run: .venv/bin/python -m pytest tests/test_dist_parallel.py
 
   nequip:
