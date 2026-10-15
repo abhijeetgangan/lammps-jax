@@ -107,6 +107,7 @@ class PairJaxKokkos : public Pair, public KokkosBase {
   template <typename Scalar>
   struct Staging {
     positions_view<Scalar> positions;
+    positions_view<Scalar> positions_lo;
     box_view<Scalar> box;
     host_box_view<Scalar> host_box;
   };

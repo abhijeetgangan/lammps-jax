@@ -39,13 +39,19 @@ struct PackAtomsFunctor {
   typename AT::t_int_1d_randomread type;
   Kokkos::View<Scalar *[3], Kokkos::LayoutRight, DeviceType> positions;
   Kokkos::View<int *, DeviceType> species;
+  // Split positions: the rounding residual x - hi, so a float32 model can form pair vectors
+  // (hi_j - hi_i) + (lo_j - lo_i) to the precision of the vector rather than of the box.
+  Kokkos::View<Scalar *[3], Kokkos::LayoutRight, DeviceType> positions_lo;
+  bool split = false;
 
   KOKKOS_INLINE_FUNCTION
   void operator()(const int i) const
   {
-    positions(i, 0) = static_cast<Scalar>(x(i, 0));
-    positions(i, 1) = static_cast<Scalar>(x(i, 1));
-    positions(i, 2) = static_cast<Scalar>(x(i, 2));
+    for (int d = 0; d < 3; ++d) {
+      const Scalar hi = static_cast<Scalar>(x(i, d));
+      positions(i, d) = hi;
+      if (split) positions_lo(i, d) = static_cast<Scalar>(x(i, d) - static_cast<double>(hi));
+    }
     // The model's species input is 0-based; LAMMPS types are 1-based.
     species(i) = type(i) - 1;
   }
@@ -391,6 +397,8 @@ void PairJaxKokkos::allocate_staging_as(int max_atoms)
 {
   auto &views = staging<Scalar>();
   views.positions = positions_view<Scalar>("lammps_jax_positions", max_atoms);
+  if (bundle.contract.split_positions)
+    views.positions_lo = positions_view<Scalar>("lammps_jax_positions_lo", max_atoms);
   if (bundle.contract.uses_box) {
     views.box = box_view<Scalar>("lammps_jax_box");
     views.host_box = host_box_view<Scalar>("lammps_jax_host_box");
@@ -805,7 +813,9 @@ void PairJaxKokkos::pack_atoms_as(int span, const PairJaxKokkos::x_view &x,
 {
   Kokkos::parallel_for("LAMMPSJAX::pack_atoms", Kokkos::RangePolicy<LMPDeviceType>(exec, 0, span),
                        PackAtomsFunctor<LMPDeviceType, Scalar>{x, type, staging<Scalar>().positions,
-                                                               d_species});
+                                                               d_species,
+                                                               staging<Scalar>().positions_lo,
+                                                               bundle.contract.split_positions});
 }
 
 void PairJaxKokkos::pack_edges(NeighListKokkos<PairJaxKokkos::device_type> *klist,
@@ -952,6 +962,11 @@ pjrt::ExecutionRequest PairJaxKokkos::make_request_as(pjrt::device::Stream strea
   if (bundle.contract.uses_box) {
     const Pointer box_pointer = reinterpret_cast<Pointer>(views.box.data());
     request.inputs.emplace_back("box", box_pointer, std::vector<int64_t>{3, 3}, real_type);
+  }
+  if (bundle.contract.split_positions) {
+    const Pointer lo_pointer = reinterpret_cast<Pointer>(views.positions_lo.data());
+    request.inputs.emplace_back("positions_lo", lo_pointer,
+                                std::vector<int64_t>{bundle.contract.max_atoms, 3}, real_type);
   }
   return request;
 }

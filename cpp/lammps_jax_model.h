@@ -67,6 +67,9 @@ struct ModelContract {
   std::vector<std::string> custom_call_targets;
   // Model takes the cell as a trailing [3,3] row-vector matrix at the contract precision.
   bool uses_box = false;
+  // Float32 only: positions arrive as hi = float(x) plus a trailing [max_atoms,3] lo = x - hi,
+  // so pair vectors keep their own precision instead of ulp(|x|), which grows with the box.
+  bool split_positions = false;
   // Pair-sum energies: any row may absorb an edge, so the half list stays exact.
   bool pair_sum = false;
   // Species the model distinguishes; more atom types abort pair_coeff. 0 means species-blind.
