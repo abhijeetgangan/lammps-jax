@@ -11,6 +11,8 @@ from typing import Any
 import jax.numpy as jnp
 import numpy as np
 
+from lammps_jax.export import pair_vectors
+
 
 
 def read_table_lines(path: str) -> list[str]:
@@ -45,8 +47,7 @@ def make_eam_energy(
         cutoff_sq = jnp.asarray(cutoff * cutoff, dtype)
         zero = jnp.asarray(0.0, dtype)
         senders, receivers = graph.senders, graph.receivers
-        rij = (positions.at[receivers].get(mode="promise_in_bounds")
-               - positions.at[senders].get(mode="promise_in_bounds"))
+        rij = pair_vectors(positions, graph, senders, receivers)
         r_sq = jnp.sum(rij * rij, axis=-1)
         valid = graph.edge_mask & (r_sq < cutoff_sq)
         envelope = jnp.where(valid, (1.0 - r_sq / cutoff_sq) ** 2, zero)
@@ -282,8 +283,7 @@ def make_setfl_energy(tables: dict, *, communicating: bool = False,
         one = jnp.asarray(1.0, dtype)
 
         senders, receivers = graph.senders, graph.receivers
-        rij = (positions.at[receivers].get(mode="promise_in_bounds")
-               - positions.at[senders].get(mode="promise_in_bounds"))
+        rij = pair_vectors(positions, graph, senders, receivers)
         r_sq = jnp.sum(rij * rij, axis=-1)
         valid = graph.edge_mask & (r_sq < cutoff_sq)
         # Nonzero fallback keeps sqrt and the phi division autodiff-safe.
@@ -354,8 +354,7 @@ def make_setfl_edge_force(tables: dict, *, communicating: bool = False,
         one = jnp.asarray(1.0, dtype)
 
         senders, receivers = graph.senders, graph.receivers
-        rij = (positions.at[receivers].get(mode="promise_in_bounds")
-               - positions.at[senders].get(mode="promise_in_bounds"))
+        rij = pair_vectors(positions, graph, senders, receivers)
         r_sq = jnp.sum(rij * rij, axis=-1)
         valid = graph.edge_mask & (r_sq < cutoff_sq)
         r = jnp.sqrt(jnp.where(valid, r_sq, one))

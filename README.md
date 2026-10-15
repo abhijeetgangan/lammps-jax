@@ -118,6 +118,16 @@ padded to capacity and an edge mask marks the live entries. The pair style
 distance-filters pairs to the model cutoff and repacks the edge list every
 step, so edge capacity sizes to the cutoff rather than cutoff plus skin.
 
+A float32 bundle receives float32 absolute positions, so a pair vector formed
+as `x_j - x_i` carries rounding of order the float32 spacing of the coordinates
+(about 1e-5 at 100 length units from the origin), whatever the pair's length.
+`export_model(split_positions=True)` adds a trailing `positions_lo` input, the
+residual `x - float32(x)` the pair style forms from LAMMPS's double positions,
+and hands it to the model on the graph. Models that form pair vectors with
+`lammps_jax.export.pair_vectors` then keep them to their own precision; the
+built-in EAM and MACE models do. LAMMPS must hold positions in double
+(`KOKKOS_PREC=double`, the default) for the residual to carry information.
+
 The pair style executes the bundle through the PJRT C API, loading the same
 plugin library jax uses on the GPU, so the build never needs XLA. Kokkos kernels
 pack the LAMMPS neighbor list into sender, receiver, and mask arrays on

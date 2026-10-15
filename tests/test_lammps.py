@@ -65,6 +65,9 @@ EXPORTS = {
                 "--precision", "float64")),
     "eam": ("export_model.py",
             ("eam", "{output}", "--max-atoms", "4096", "--edges-per-atom", "64")),
+    "eam_split": ("export_model.py",
+                  ("eam", "{output}", "--max-atoms", "4096", "--edges-per-atom", "64",
+                   "--split-positions")),
     "eam_f64": ("export_model.py",
                 ("eam", "{output}", "--max-atoms", "4096", "--edges-per-atom", "64",
                  "--precision", "float64")),
@@ -189,6 +192,45 @@ create_atoms 1 box
 mass 1 1.0
 
 displace_atoms all random 0.03 0.03 0.03 12345 units box
+
+neighbor 0.3 bin
+neigh_modify every 1 delay 0 check yes one 256 page 500000
+
+pair_style jax/kk ${pjrt}
+pair_coeff * * ${bundle}
+
+thermo 1
+thermo_style custom step atoms pe press
+thermo_modify norm no format float %.16g
+
+dump forces all custom 1 ${dump_path} id type x y z fx fy fz
+dump_modify forces sort id format float %.16g first yes
+
+run_style verlet/kk
+run 0
+""",
+
+    "eam_far_static": """\
+variable bundle index eam.lammps-jax.json
+variable dump_path index eam_far_static.dump
+variable newton_setting index on
+
+units lj
+atom_style atomic
+boundary p p p
+newton ${newton_setting}
+
+lattice fcc 0.8
+region box block 0 4 0 4 0 4
+create_box 1 box
+create_atoms 1 box
+mass 1 1.0
+
+displace_atoms all random 0.03 0.03 0.03 12345 units box
+# Translate box and atoms ~1700 units from the origin, where float32 absolute positions round to
+# ~1e-4.  After displace_atoms: its random stream is seeded from coordinates, so lattice points
+# generated far out differ per decomposition and the 1- and 2-rank runs would not agree.
+change_box all x delta $(1000*xlat) $(1000*xlat) remap units box
 
 neighbor 0.3 bin
 neigh_modify every 1 delay 0 check yes one 256 page 500000
@@ -430,6 +472,13 @@ CASES = {
     "cuzr_pallas_rows_full_static": dict(
         kind="static", deck="cuzr_static", bundle="cuzr_pallas_rows_full", newton="off",
         dense="cuzr"),
+    # Far from the origin, split positions keep float32 pair vectors exact enough for the dense
+    # tolerance; "eam_far_plain" (no split) is the contrast, run by test_split_positions_far_box.
+    "eam_far_split_static": dict(
+        kind="static", deck="eam_far_static", bundle="eam_split", newton="on",
+        pressure=True, dense="eam"),
+    "eam_far_plain": dict(
+        kind="contrast", deck="eam_far_static", bundle="eam", newton="on", dense="eam"),
     "eam_nve": dict(kind="nve", deck="eam_nve", bundle="eam", dense="eam"),
     # Lists rebuilt every other step: the matrix copy is skipped, then refreshed after migration.
     "cuzr_pallas_rows_nve": dict(kind="nve", deck="cuzr_nve", bundle="cuzr_pallas_rows",
@@ -988,6 +1037,21 @@ def test_static_rank_invariance(runner, case):
                                     MAX_F64_ENERGY_ERROR_PER_ATOM if float64
                                     else MAX_DENSE_ENERGY_ERROR_PER_ATOM)
         assert abs(energy - potential[1]) / natoms <= dense_energy_tol
+
+
+@requires_lammps
+def test_split_positions_far_box(runner):
+    """In a box ~1700 units from the origin, plain float32 positions round every pair vector
+    to ulp(1700) ~ 1e-4 and the forces miss the dense float64 reference by far more than its
+    tolerance; with split_positions the plugin's x - float32(x) residual restores them."""
+    errors = {}
+    for case in ("eam_far_plain", "eam_far_split_static"):
+        frame = runner.rank_pair(case)[0][1][0]
+        _energy, forces = DENSE_REFERENCES["eam"](frame)
+        dumped = np.stack([frame[name] for name in FORCE_COLUMNS], axis=1)
+        errors[case] = float(np.max(np.abs(forces - dumped)))
+    assert errors["eam_far_split_static"] <= MAX_DENSE_FORCE_ERROR, errors
+    assert errors["eam_far_plain"] > 10 * errors["eam_far_split_static"], errors
 
 
 @requires_lammps

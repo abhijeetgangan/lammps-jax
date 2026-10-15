@@ -14,7 +14,10 @@ from lammps_jax.export import (
     BUNDLE_FORMAT,
     EDGE_FORCE,
     SPARSE_EDGE_LAYOUT,
+    SPLIT_POSITIONS_SUFFIX,
+    LammpsNeighborList,
     export_model,
+    pair_vectors,
     program_text,
     wrap_energy_fn,
 )
@@ -380,3 +383,90 @@ def test_energy_select_local_vs_total():
     assert float(energy) == pytest.approx(expected_total, abs=1e-5)
     expected_f0 = jnp.array([2.0, 4.0, 0.0], dtype=jnp.float32)
     assert jnp.allclose(forces[0], expected_f0, atol=1e-5)
+
+
+def split_pair_energy(positions, species, graph):
+    """helpers.pair_energy with pair vectors from pair_vectors (split-aware)."""
+    del species
+    rij = pair_vectors(positions, graph, graph.senders, graph.receivers)
+    per_edge = 0.5 * jnp.where(graph.edge_mask, jnp.sum(rij * rij, axis=-1), 0.0)
+    safe_senders = jnp.where(graph.edge_mask, graph.senders, 0)
+    return jnp.zeros((positions.shape[0],), dtype=positions.dtype).at[safe_senders].add(per_edge)
+
+
+@pytest.mark.parametrize("uses_box", [False, True])
+def test_export_model_split_positions_contract_and_abi(tmp_path, uses_box):
+    """split_positions appends positions_lo [max_atoms, 3] after the box and tags the format."""
+
+    def energy(positions, species, graph, *box):
+        base = split_pair_energy(positions, species, graph)
+        return base + (jnp.float32(0.0) * jnp.sum(box[0]) if box else 0.0)
+
+    data = export_and_load(
+        tmp_path / "split.json",
+        energy_fn=energy,
+        uses_box=uses_box,
+        split_positions=True,
+        max_atoms=4,
+        max_edges=6,
+        cutoff=2.0,
+        unit_style="lj",
+    )
+    assert data["format"] == BUNDLE_FORMAT + SPLIT_POSITIONS_SUFFIX
+    assert data["contract"]["split_positions"] is True
+    main = re.search(r"func\.func public @main\((.*?)\)\s*->",
+                     program_text(data, "energy_and_forces_mlir"), re.S).group(1)
+    args = re.findall(r"%arg\d+: (tensor<[^>]*>)", main)
+    assert len(args) == (9 if uses_box else 8)
+    assert args[-1] == "tensor<4x3xf32>"
+
+
+def test_export_model_split_positions_default_off(tmp_path):
+    data = export_and_load(tmp_path / "plain.json", energy_fn=pair_energy, max_atoms=4, max_edges=6,
+                           cutoff=2.0, unit_style="lj")
+    assert data["format"] == BUNDLE_FORMAT
+    assert data["contract"]["split_positions"] is False
+
+
+def test_export_model_split_positions_rejects_float64(tmp_path):
+    with jax.enable_x64(True), pytest.raises(ValueError, match="split_positions is for float32"):
+        export_model(path=tmp_path / "x.json", energy_fn=split_pair_energy, max_atoms=4, max_edges=6,
+                     cutoff=2.0, unit_style="lj", precision="float64", split_positions=True)
+
+
+def test_pair_vectors_without_split_is_the_plain_difference():
+    positions = jnp.asarray(random_system(seed=3, n_atoms=8))
+    i, j = jnp.arange(7), jnp.arange(1, 8)
+    graph = LammpsNeighborList(i, j, jnp.ones(7, bool))
+    assert np.array_equal(np.asarray(pair_vectors(positions, graph, i, j)),
+                          np.asarray(positions[j] - positions[i]))
+
+
+def test_split_positions_forces_are_box_independent():
+    """Atoms 1000 units from the origin: float32 absolute positions round pair vectors to
+    ulp(1000) ~ 6e-5, so plain float32 forces of a harmonic pair model (F = sum rij) err by
+    ~1e-4; with the plugin's split (lo = x - float32(x)) they match float64 to float32
+    precision of the vectors themselves."""
+    max_atoms, cutoff = 32, 1.5
+    x64 = random_system(seed=7, n_atoms=max_atoms, box=(4.0, 2.0, 2.0)).astype(np.float64) + 1000.0
+    senders, receivers = edges_within_cutoff(x64, cutoff)
+    hi = x64.astype(np.float32)
+    lo = (x64 - hi.astype(np.float64)).astype(np.float32)             # what PackAtomsFunctor writes
+    rij = x64[receivers] - x64[senders]
+    ref = np.zeros_like(x64)
+    np.add.at(ref, senders, rij)
+    np.add.at(ref, receivers, -rij)
+
+    def call_split(model_fn, model_args):
+        positions, species, nlocal, nghost, s, r, m, lo_arg = model_args
+        graph = LammpsNeighborList(s, r, m, positions_lo=lo_arg)
+        return model_fn(positions, species, graph), graph, nlocal, nghost
+
+    abi = (jnp.asarray(hi), jnp.zeros(max_atoms, jnp.int32), jnp.int32(max_atoms), jnp.int32(0),
+           jnp.asarray(senders), jnp.asarray(receivers), jnp.ones(len(senders), jnp.bool_))
+    _, _, plain = wrap_energy_fn(split_pair_energy, max_atoms=max_atoms, call_model=call_model)
+    _, _, split = wrap_energy_fn(split_pair_energy, max_atoms=max_atoms, call_model=call_split)
+    err_plain = np.abs(np.asarray(plain(*abi)[1]) - ref).max()
+    err_split = np.abs(np.asarray(split(*abi, jnp.asarray(lo))[1]) - ref).max()
+    assert err_plain > 1e-5                     # the box-sized rounding this option removes
+    assert err_split < 2e-6, err_split          # ~ulp of |rij| ~ 1, times a few summed edges
