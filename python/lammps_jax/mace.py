@@ -11,6 +11,8 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 
+from lammps_jax.export import pair_vectors
+
 
 def collapse_skip(block: Any, elements: Sequence[int], num_elements: int) -> Any:
     """Copy of an interaction block whose skip connection is one matmul per element.
@@ -87,7 +89,7 @@ def make_mace_energy(
         neighbors = jnp.where(graph.edge_mask, graph.receivers, 0)
         edge_index = jnp.stack([neighbors, centers], axis=0)
 
-        vectors = positions[centers] - positions[neighbors]
+        vectors = pair_vectors(positions, graph, neighbors, centers)
         pad_vector = jnp.array([1.0, 0.0, 0.0], dtype=vectors.dtype) * r_max
         vectors = jnp.where(graph.edge_mask[:, None], vectors, pad_vector)
         lengths = jnp.linalg.norm(vectors, axis=-1, keepdims=True)

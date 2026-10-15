@@ -10,7 +10,7 @@ import jax.numpy as jnp
 
 from lammps_jax.eam import (load_funcfl, load_setfl, make_eam_energy,
                             make_setfl_edge_force, make_setfl_energy)
-from lammps_jax.export import export_model
+from lammps_jax.export import export_model, pair_vectors
 
 
 def lj_energy_terms(r_sq, mask, *, cutoff_sq, epsilon, sigma_sq):
@@ -37,8 +37,7 @@ def make_lj_energy(*, cutoff: float, epsilon: float, sigma: float, edge_energy_s
     def lj_energy(positions, species, graph):
         del species
         dtype = positions.dtype
-        rij = (positions.at[graph.receivers].get(mode="promise_in_bounds")
-               - positions.at[graph.senders].get(mode="promise_in_bounds"))
+        rij = pair_vectors(positions, graph, graph.senders, graph.receivers)
         r_sq = jnp.sum(rij * rij, axis=-1)
         valid, per_edge = lj_energy_terms(r_sq, graph.edge_mask, **params)
         per_edge = jnp.asarray(edge_energy_scale, dtype) * jnp.where(
@@ -66,8 +65,7 @@ def make_lj_edge_force(*, cutoff: float, epsilon: float, sigma: float):
 
     def lj_edge_force(positions, species, graph):
         del species
-        rij = (positions.at[graph.receivers].get(mode="promise_in_bounds")
-               - positions.at[graph.senders].get(mode="promise_in_bounds"))
+        rij = pair_vectors(positions, graph, graph.senders, graph.receivers)
         edge_force = edge_grad(rij)
         return jnp.where(graph.edge_mask[:, None], edge_force, jnp.asarray(0.0, edge_force.dtype))
 
@@ -94,6 +92,12 @@ def add_shared_arguments(parser, *, max_atoms, edges_per_atom):
         choices=("float32", "float64"),
         default="float32",
         help="Floating-point ABI of the exported programs.",
+    )
+    parser.add_argument(
+        "--split-positions",
+        action="store_true",
+        help="float32: pass the residual x - float32(x) so pair vectors keep their own "
+             "precision far from the origin (export_model split_positions).",
     )
     parser.add_argument(
         "--platform",
@@ -142,6 +146,7 @@ def export_lj(args, max_edges):
         cutoff=args.cutoff,
         unit_style="lj",
         precision=args.precision,
+        split_positions=args.split_positions,
         newton=args.newton,
         force_output="edge-force" if args.force_output == "edge" else "atom-force",
         uses_box=args.uses_box,
@@ -203,6 +208,7 @@ def export_eam(args, max_edges, parser):
         cutoff=cutoff,
         unit_style=unit_style,
         precision=args.precision,
+        split_positions=args.split_positions,
         force_output="edge-force" if force_fn is not None else "atom-force",
         newton="on",
         comm=communicating,

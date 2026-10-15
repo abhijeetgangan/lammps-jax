@@ -239,12 +239,24 @@ ModelBundle load_bundle_file(const std::string &path)
   bundle.contract.custom_call_targets = get_string_array_or(json, "custom_call_targets");
   bundle.contract.uses_box = get_bool(json, "uses_box");
   bundle.contract.pair_sum = get_bool_or(json, "pair_sum", false);
+  bundle.contract.split_positions = get_bool_or(json, "split_positions", false);
   bundle.contract.n_species = get_int_or(json, "n_species", 0);
   if (bundle.contract.n_species < 0) throw std::runtime_error("Invalid n_species in bundle");
   bundle.contract.max_owned = get_int_or(json, "max_owned", 0);
   if (bundle.contract.max_owned < 0 || bundle.contract.max_owned > bundle.contract.max_atoms)
     throw std::runtime_error("Invalid max_owned in bundle");
 
+  // The "+split-positions" suffix makes loaders that predate the trailing positions_lo input
+  // reject the bundle rather than call the program one input short.
+  const std::string split_suffix = "+split-positions";
+  const bool split_tag = bundle.format.size() > split_suffix.size() &&
+      bundle.format.compare(bundle.format.size() - split_suffix.size(), split_suffix.size(),
+                            split_suffix) == 0;
+  if (split_tag != bundle.contract.split_positions)
+    throw std::runtime_error("Bundle format tag and split_positions disagree");
+  if (split_tag) bundle.format.resize(bundle.format.size() - split_suffix.size());
+  if (bundle.contract.split_positions && bundle.contract.precision != Precision::Float32)
+    throw std::runtime_error("split_positions needs a float32 bundle; float64 positions are exact");
   // Distinct tags make loaders that predate n_hops, comm, or half-edge packing reject the bundle.
   if (bundle.format != "lammps-jax-json" &&
       bundle.format != "lammps-jax-json-distributed" &&
