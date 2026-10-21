@@ -65,6 +65,7 @@ jobs:
       - run: >
           uv pip install --torch-backend=cpu mace-torch
           'mace-jax @ git+https://github.com/ACEsuit/mace-jax@fe19806ad8077a90975eeb83fdd777a9513e9f0c'
+          'jax<0.12' 'jaxlib<0.12'
       - uses: actions/cache@v4
         id: bundle
         with:
