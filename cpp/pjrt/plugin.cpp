@@ -1,5 +1,6 @@
 #include "pjrt/plugin.h"
 
+#include "pjrt/device.h"
 #include "pjrt/handles.h"
 
 #if __has_include("xla/pjrt/c/pjrt_c_api_ffi_extension.h")
@@ -12,6 +13,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <map>
 #include <stdexcept>
 #include <string>
@@ -150,8 +152,8 @@ void register_external_ffi_handlers(const PluginLibrary &library,
     args.target_name = target.c_str();
     args.target_name_size = target.size();
     args.handler = handler;
-    args.platform_name = "CUDA";
-    args.platform_name_size = 4;
+    args.platform_name = device::platform_name();
+    args.platform_name_size = std::strlen(device::platform_name());
     args.traits = static_cast<PJRT_FFI_Handler_TraitsBits>(0);
     library.check(extension->register_handler(&args),
                   "PJRT_FFI_Register_Handler(" + target + ")");
