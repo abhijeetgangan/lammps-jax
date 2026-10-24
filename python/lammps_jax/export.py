@@ -24,6 +24,8 @@ BUNDLE_FORMAT = "lammps-jax-json"
 DISTRIBUTED_BUNDLE_FORMAT = "lammps-jax-json-distributed"
 # Each pair packed once; a loader packing both directions double counts.
 HALF_EDGE_BUNDLE_FORMAT = "lammps-jax-json-half-edge"
+# Appended to the format tag of split_positions bundles.
+SPLIT_POSITIONS_SUFFIX = "+split-positions"
 SPARSE_EDGE_LAYOUT = "sparse-edge"
 NEIGHBOR_MATRIX_LAYOUT = "neighbor-matrix"
 ATOM_FORCE = "atom-force"
@@ -34,21 +36,49 @@ PRECISIONS = ("float32", "float64")
 
 
 class LammpsNeighborList(NamedTuple):
-    """Sparse LAMMPS edge-list view exposed to exported models."""
+    """Sparse LAMMPS edge-list view exposed to exported models.
+
+    positions_lo: the split_positions residual (see `pair_vectors`), None otherwise.
+    """
 
     senders: jax.Array
     receivers: jax.Array
     edge_mask: jax.Array
+    positions_lo: jax.Array | None = None
 
 
 class LammpsNeighborMatrix(NamedTuple):
-    """The LAMMPS list as [max_neighbors, rows] int32, slots filled from 0, padding max_atoms."""
+    """The LAMMPS list as [max_neighbors, rows] int32, slots filled from 0, padding max_atoms.
+
+    positions_lo: the split_positions residual (see `pair_vectors`), None otherwise.
+    """
 
     neighbors: jax.Array
     num_neighbors: jax.Array
+    positions_lo: jax.Array | None = None
 
 
 Graph = LammpsNeighborList | LammpsNeighborMatrix
+
+
+def pair_vectors(positions: jax.Array, graph: Graph, i: jax.Array, j: jax.Array) -> jax.Array:
+    """positions[j] - positions[i] for index arrays i, j (any matching shapes), gathered with
+    mode="promise_in_bounds".
+
+    A float32 bundle receives float32 absolute positions, so a plain difference carries
+    ~ulp(|x|) of rounding: an error that grows with the box (~1e-5 A at 100 A) and becomes
+    the dominant float32 force error of a well-conditioned model at scale.  With
+    split_positions the residual lo = x - float(x) rides on the graph and the difference is
+    formed as (hi_j - hi_i) + (lo_j - lo_i): for atoms within a cutoff and away from the
+    origin hi_j - hi_i is exact (Sterbenz), so the vector keeps its own precision whatever
+    the box.  Gradients flow through positions as usual.
+    """
+    get = lambda a, k: a.at[k].get(mode="promise_in_bounds")
+    d = get(positions, j) - get(positions, i)
+    lo = getattr(graph, "positions_lo", None)        # duck-typed graphs (emulation, dist/) carry none
+    if lo is not None:
+        d = d + (get(lo, j) - get(lo, i))
+    return d
 
 
 def has_ghost_rows(graph: Graph, nlocal: Any) -> jax.Array:
@@ -231,6 +261,7 @@ def export_model(
     max_owned: int | None = None,
     pair_sum: bool = False,
     platform: str = "cuda",
+    split_positions: bool = False,
 ) -> dict[str, Any]:
     """Export a JAX model to a fixed-capacity LAMMPS-JAX JSON bundle.
 
@@ -241,6 +272,10 @@ def export_model(
     platform ("cuda" or "cpu") is the PJRT plugin the bundle will run on: some
     primitives lower differently per platform (a cumsum lowered for cuda aborts
     XLA's CPU compiler).
+    split_positions (float32 only) adds a trailing positions_lo input, the residual
+    x - float(x) the plugin forms from LAMMPS's double positions, handed to the model as
+    graph.positions_lo; models that form pair vectors with `pair_vectors` then keep them
+    to their own precision instead of ulp of the box.  Models that ignore it are unchanged.
     """
     if energy_fn is None and force_fn is None:
         raise ValueError("provide energy_fn or force_fn")
@@ -270,6 +305,8 @@ def export_model(
         raise ValueError("platform must be 'cuda' or 'cpu'")
     if precision not in PRECISIONS:
         raise ValueError(f"precision must be one of {list(PRECISIONS)}")
+    if split_positions and precision != "float32":
+        raise ValueError("split_positions is for float32 bundles; float64 positions are exact")
     if n_species is not None and n_species < 1:
         raise ValueError("n_species must be positive when given")
     if precision == "float64" and not jax.config.jax_enable_x64:  # ty: ignore[unresolved-attribute]
@@ -366,6 +403,8 @@ def export_model(
     )
     if uses_box:
         args += (jax.ShapeDtypeStruct((3, 3), dtype),)
+    if split_positions:
+        args += (jax.ShapeDtypeStruct((max_atoms, 3), dtype),)  # positions_lo, after the box
     n_fixed = 4 + len(graph_args)
 
     def call_model_with(
@@ -377,6 +416,8 @@ def export_model(
         graph: Graph = (LammpsNeighborMatrix(*model_args[4:n_fixed]) if matrix
                         else LammpsNeighborList(*model_args[4:n_fixed]))
         extra = (model_args[n_fixed],) if uses_box else ()
+        if split_positions:
+            graph = graph._replace(positions_lo=model_args[n_fixed + int(uses_box)])
         if comm_obj is not None:
             value = comm_obj.sequence(model_fn(positions, species, graph, *extra, comm_obj))
             comm_obj.validate()
@@ -521,9 +562,11 @@ def export_model(
     compile_options.compile_portable_executable = True
 
     distributed = n_hops > 1 or comm
+    bundle_format = (HALF_EDGE_BUNDLE_FORMAT if half_edges
+                     else DISTRIBUTED_BUNDLE_FORMAT if distributed else BUNDLE_FORMAT)
     bundle = {
-        "format": HALF_EDGE_BUNDLE_FORMAT if half_edges
-        else DISTRIBUTED_BUNDLE_FORMAT if distributed else BUNDLE_FORMAT,
+        # A plugin that predates positions_lo must reject, not call the program one input short.
+        "format": bundle_format + SPLIT_POSITIONS_SUFFIX if split_positions else bundle_format,
         "programs": {
             "force_mlir_b64": export_mlir(force_program),
             "energy_mlir_b64": export_mlir(energy_program),
@@ -557,6 +600,7 @@ def export_model(
             ),
             "uses_box": uses_box,
             "pair_sum": pair_sum,
+            "split_positions": split_positions,
         },
     }
     if n_species is not None:
